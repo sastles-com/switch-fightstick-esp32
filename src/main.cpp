@@ -25,9 +25,10 @@ constexpr int kRowAnchorSettleFrames = 0;  // Original互換: 行アンカー待
 constexpr int kStopPressEchoes = 2;  // Original互換: ECHOES=2
 constexpr int kMoveXEchoes = 2;  // Original互換: ECHOES=2
 constexpr int kAnchorMoveEchoes = 2;  // Original互換: ECHOES=2
-constexpr int kMoveYEchoes = 0;  // Yは単発入力にして過移動を抑える
+constexpr int kMoveYEchoes = 1;  // Y移動を合計2フレーム保持して0px取りこぼしを減らす
 constexpr int kPostMoveXSettleFrames = 0;  // Original互換: 追加待機なし
-constexpr int kPostMoveYSettleFrames = 2;  // Y移動後に中立待機を入れて連続下入力を防ぐ
+constexpr int kPreMoveYSettleFrames = 2;  // Y移動前に中立待機を挟んで誤検出を減らす
+constexpr int kPostMoveYSettleFrames = 2;  // Y移動後にも中立待機を入れて連続下入力を防ぐ
 
 constexpr int kPreviewX = 4;
 constexpr int kPreviewY = 20;
@@ -73,6 +74,7 @@ typedef enum {
   STATE_STOP_X,
   STATE_STOP_Y,
   STATE_MOVE_X,
+  STATE_PRE_MOVE_Y_SETTLE,
   STATE_POST_MOVE_X_SETTLE,
   STATE_MOVE_Y,
   STATE_POST_MOVE_Y_SETTLE,
@@ -105,6 +107,7 @@ typedef struct {
   int report_count;
   int xpos;
   int ypos;
+  int pre_move_y_settle_frames;
   print_state_t post_move_x_next_state;
   int post_move_x_settle_frames;
   int post_move_y_settle_frames;
@@ -433,11 +436,21 @@ static void build_next_report(switch_input_report_t *report) {
     case STATE_STOP_Y:
       press_a_if_current_pixel_should_ink(report);
       if (printer_state.ypos < (kImageHeight - 1)) {
-        printer_state.state = STATE_MOVE_Y;
+        printer_state.pre_move_y_settle_frames = kPreMoveYSettleFrames;
+        printer_state.state = STATE_PRE_MOVE_Y_SETTLE;
       } else {
         printer_state.state = STATE_DONE;
       }
       printer_state.echoes = kStopPressEchoes;  // A押下をエコーで確実に届ける
+      break;
+
+    case STATE_PRE_MOVE_Y_SETTLE:
+      if (printer_state.pre_move_y_settle_frames > 0) {
+        printer_state.pre_move_y_settle_frames--;
+      }
+      if (printer_state.pre_move_y_settle_frames == 0) {
+        printer_state.state = STATE_MOVE_Y;
+      }
       break;
 
     case STATE_MOVE_X:
