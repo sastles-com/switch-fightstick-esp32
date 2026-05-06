@@ -18,10 +18,16 @@ constexpr int kImageWidth = 320;
 constexpr int kImageHeight = 120;
 constexpr int kImageBytesPerRow = 40;
 constexpr int kStickNeutral = 128;
-constexpr int kReportIntervalMs = 16;  // 精度優先: Switch HID polling に十分なマージン
+constexpr int kReportIntervalMs = 5;  // Original互換: 5ms polling相当
 constexpr int kDisplayRefreshMs = 100;
-constexpr int kRowAnchorOvershootSteps = 30;  // 精度優先: 端に確実に当てる
-constexpr int kRowAnchorSettleFrames = 5;   // 精度優先: 安定待ちを長めに
+constexpr int kRowAnchorOvershootSteps = 0;  // Original互換: 行アンカー無効
+constexpr int kRowAnchorSettleFrames = 0;  // Original互換: 行アンカー待機なし
+constexpr int kStopPressEchoes = 2;  // Original互換: ECHOES=2
+constexpr int kMoveXEchoes = 2;  // Original互換: ECHOES=2
+constexpr int kAnchorMoveEchoes = 2;  // Original互換: ECHOES=2
+constexpr int kMoveYEchoes = 0;  // Yは単発入力にして過移動を抑える
+constexpr int kPostMoveXSettleFrames = 0;  // Original互換: 追加待機なし
+constexpr int kPostMoveYSettleFrames = 2;  // Y移動後に中立待機を入れて連続下入力を防ぐ
 
 constexpr int kPreviewX = 4;
 constexpr int kPreviewY = 20;
@@ -67,7 +73,9 @@ typedef enum {
   STATE_STOP_X,
   STATE_STOP_Y,
   STATE_MOVE_X,
+  STATE_POST_MOVE_X_SETTLE,
   STATE_MOVE_Y,
+  STATE_POST_MOVE_Y_SETTLE,
   STATE_REANCHOR_ROW,
   STATE_REANCHOR_SETTLE,
   STATE_DONE,
@@ -97,6 +105,9 @@ typedef struct {
   int report_count;
   int xpos;
   int ypos;
+  print_state_t post_move_x_next_state;
+  int post_move_x_settle_frames;
+  int post_move_y_settle_frames;
   int row_anchor_steps;
   int row_settle_frames;
   bool armed;
@@ -416,7 +427,7 @@ static void build_next_report(switch_input_report_t *report) {
     case STATE_STOP_X:
       press_a_if_current_pixel_should_ink(report);
       printer_state.state = STATE_MOVE_X;
-      printer_state.echoes = 2;  // A押下をエコーで確実に届ける
+      printer_state.echoes = kStopPressEchoes;  // A押下をエコーで確実に届ける
       break;
 
     case STATE_STOP_Y:
@@ -426,7 +437,7 @@ static void build_next_report(switch_input_report_t *report) {
       } else {
         printer_state.state = STATE_DONE;
       }
-      printer_state.echoes = 2;  // A押下をエコーで確実に届ける
+      printer_state.echoes = kStopPressEchoes;  // A押下をエコーで確実に届ける
       break;
 
     case STATE_MOVE_X:
@@ -439,18 +450,39 @@ static void build_next_report(switch_input_report_t *report) {
       }
 
       if (printer_state.xpos > 0 && printer_state.xpos < (kImageWidth - 1)) {
-        printer_state.state = STATE_STOP_X;
+        printer_state.post_move_x_next_state = STATE_STOP_X;
       } else {
-        printer_state.state = STATE_STOP_Y;
+        printer_state.post_move_x_next_state = STATE_STOP_Y;
       }
-      // 移動系はエコーなし: 1フレームのみ入力してカーソルを1ピクセル動かす
+      printer_state.echoes = kMoveXEchoes;
+      printer_state.post_move_x_settle_frames = kPostMoveXSettleFrames;
+      printer_state.state = STATE_POST_MOVE_X_SETTLE;
+      break;
+
+    case STATE_POST_MOVE_X_SETTLE:
+      if (printer_state.post_move_x_settle_frames > 0) {
+        printer_state.post_move_x_settle_frames--;
+      }
+      if (printer_state.post_move_x_settle_frames == 0) {
+        printer_state.state = printer_state.post_move_x_next_state;
+      }
       break;
 
     case STATE_MOVE_Y:
       report->hat = HAT_BOTTOM;
       printer_state.ypos++;
-      begin_row_anchor();
-      // 移動系はエコーなし: 1フレームのみ入力してカーソルを1行動かす
+      printer_state.echoes = kMoveYEchoes;
+      printer_state.post_move_y_settle_frames = kPostMoveYSettleFrames;
+      printer_state.state = STATE_POST_MOVE_Y_SETTLE;
+      break;
+
+    case STATE_POST_MOVE_Y_SETTLE:
+      if (printer_state.post_move_y_settle_frames > 0) {
+        printer_state.post_move_y_settle_frames--;
+      }
+      if (printer_state.post_move_y_settle_frames == 0) {
+        begin_row_anchor();
+      }
       break;
 
     case STATE_REANCHOR_ROW:
@@ -461,7 +493,7 @@ static void build_next_report(switch_input_report_t *report) {
       if (printer_state.row_anchor_steps == 0) {
         printer_state.state = STATE_REANCHOR_SETTLE;
       }
-      // 過走査もエコーなし: 毎フレーム1ステップずつ端へ押し付ける
+      printer_state.echoes = kAnchorMoveEchoes;
       break;
 
     case STATE_REANCHOR_SETTLE:
@@ -479,7 +511,7 @@ static void build_next_report(switch_input_report_t *report) {
   }
 
   memcpy(&printer_state.last_report, report, sizeof(*report));
-  // echoes はSTOP系で個別設定済み。移動系・アンカー系は0のまま(エコーなし)。
+  // echoes は状態ごとに個別設定。
 }
 
 // 表示専用タスク: HIDタスクと分離して描画がUSB送信タイミングを邪魔しないようにする

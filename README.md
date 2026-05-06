@@ -154,26 +154,86 @@ python3 debug_image.py
 
 - **ファイル**: `src/main.cpp` — `STATE_STOP_X` / `STATE_STOP_Y` 内で `printer_state.echoes = 2` を個別設定
 
----（`src/main.cpp` の `namespace` ブロック）
+#### [7] X移動の保持時間を個別調整
+
+- **問題**: Y方向の過移動対策で移動系を単発化した後、X方向だけ入力が通りにくくなるケースが出た
+- **修正**: X方向移動と左右アンカーのみ短い保持（2フレーム）を付与し、Y方向は単発維持
+
+| 状態 | エコー | 目的 |
+|---|---|---|
+| `STATE_MOVE_X` | 1（合計2フレーム） | X移動の取りこぼし対策 |
+| `STATE_REANCHOR_ROW` | 1（合計2フレーム） | 左右端へのアンカー精度向上 |
+| `STATE_MOVE_Y` | 0（単発） | 縦方向の過移動を抑制 |
+
+- **ファイル**: `src/main.cpp` — `kMoveXEchoes` と `kAnchorMoveEchoes` を追加
+
+---
+
+## 現在のパラメータ設定（`src/main.cpp` の `namespace` ブロック）
 
 | 定数名 | 現在値 | 単位 | 説明 | 小さくすると | 大きくすると |
 |---|---|---|---|---|---|
-| `kReportIntervalMs` | 16 | ms | HID レポートの送信間隔 | 速くなるがロストしやすい | 遅くなるが確実 |
-| `kRowAnchorOvershootSteps` | 30 | フレーム | 行開始時に端方向へ押し続けるフレーム数 | 端への押し付けが弱くなる | 確実に端に当たるが遅くなる |
-| `kRowAnchorSettleFrames` | 5 | フレーム | 端到達後に入力なしで待つフレーム数 | カーソルが安定しないまま描画開始 | より安定するが遅くなる |
-| `kDisplayRefreshMs` | 100 | ms | LCD 表示の更新間隔 | 表示が滑らかになる（HID への影響は分離済みで少ない） | 表示更新が粗くなる |
+| `kReportIntervalMs` | 5 | ms | HID レポートの送信間隔 | 速くなるがロストしやすい | 遅くなるが安定しやすい |
+| `kRowAnchorOvershootSteps` | 0 | フレーム | 行開始時の端方向過走査フレーム数 | アンカー動作がなくなる | 端合わせが強くなるが遅くなる |
+| `kRowAnchorSettleFrames` | 0 | フレーム | アンカー後の待機フレーム数 | 即描画開始 | 安定するが遅くなる |
+| `kStopPressEchoes` | 2 | フレーム | STOP状態のA押下を繰り返す回数 | A押下取りこぼしが増える | A押下は安定するが遅くなる |
+| `kMoveXEchoes` | 2 | フレーム | X移動入力の保持回数（合計3フレーム） | X移動が通りにくくなる | X移動は通りやすいが過移動リスク増 |
+| `kAnchorMoveEchoes` | 2 | フレーム | アンカー移動入力の保持回数（合計3フレーム） | 端到達が不安定になる | 端到達は安定するが速度低下 |
+| `kMoveYEchoes` | 0 | フレーム | Y移動入力の保持回数（合計1フレーム） | さらに単発化される | 縦過移動リスクが増える |
+| `kPostMoveXSettleFrames` | 0 | フレーム | X移動後の中立待機フレーム数 | すぐ次入力へ | 安定するが遅くなる |
+| `kPostMoveYSettleFrames` | 2 | フレーム | Y移動後の中立待機フレーム数 | 連続下入力が起きやすい | 縦方向の過移動を抑えやすい |
+| `kDisplayRefreshMs` | 100 | ms | LCD表示の更新間隔 | 表示更新が細かくなる | 表示更新が粗くなる |
 
-`echoes`（同一入力の繰り返し回数）は `build_next_report` 末尾の `printer_state.echoes = 4;` で変更。
-大きくするほど 1 フレームのロストを補完しやすいが、1 ピクセル移動の確定に時間がかかる。
+---
+
+## パラメータ設定の履歴
+
+| 項目 | 変更履歴 | 目的・理由 |
+|---|---|---|
+| `kReportIntervalMs` | 5 → 16 → 8 | 取りこぼし対策で一度16msへ。縦過移動抑制と速度バランスで8msへ再調整 |
+| `kRowAnchorOvershootSteps` | 6 → 10 → 20 → 30 → 45 → 0 | 端合わせ強化を試行後、Original互換検証のため0へ |
+| `kRowAnchorSettleFrames` | 2 → 5 → 0 | 安定待ち追加を試行後、Original互換検証のため0へ |
+| STOP系エコー | 2 → 4 → 2 → 3 → 2 | 全体4を分離。最終的にOriginal互換2へ |
+| X移動エコー | 0 → 1 → 2 | X入力不足対策として段階的に増加 |
+| アンカー移動エコー | 0 → 1 → 3 → 2 | 端到達改善を試行後、Original互換寄りに調整 |
+| Y移動エコー | 0 → 2 → 0 | Original互換検証後、縦過移動抑制のため0へ戻し |
+| `kPostMoveYSettleFrames` | 0 → 2 | Y移動後の惰性入力抑制を追加 |
+
+---
+
+## デバッグ対応（実施済み）
+
+1. image_data の逆変換検証
+- `debug_image.py` で `src/image_data.c` を PNG に復元
+- `plate.png` との差分ピクセルを計算して一致確認
+
+2. 送信失敗時の状態巻き戻し
+- `SendReport` 失敗時に `printer_state` を復元
+- 内部座標だけ進む不整合を防止
+
+3. 表示負荷とUSB送信の分離
+- `display_task` と `usb_report_task` を分割
+- LCD描画による HID 送信遅延を低減
+
+4. X/Y 別の入力制御
+- Xは保持時間を増やし、Yは単発+中立待機で過移動を抑制
+
+---
+
+## 参考にしたリポジトリ
+
+- https://github.com/shinyquagsire23/Switch-Fightstick
+- https://github.com/Loloweb/Switch-Fightstick
+- https://github.com/progmem/Switch-Fightstick
 
 ---
 
 ## 所要時間の目安
 
-320列 × 120行 × (1 + echoes) フレーム × kReportIntervalMs で概算。
+状態ごとにエコー数が異なるため、以下は実運用時の目安時間。
 
 | 設定 | 所要時間 |
 |---|---|
-| 5ms / echoes=2 | 約3分（精度低）|
-| 8ms / echoes=2 | 約5分 |
-| 16ms / echoes=4 | 約15〜20分（精度優先）|
+| 初期（5ms / echoes=2 一律） | 約3分（高速だがズレやすい） |
+| 精度優先版（16ms / echoes=4 一律） | 約15〜20分（遅いが安定） |
+| 現在（5ms / STOP=2 / MOVE_X=2 / MOVE_Y=0 / postY=2） | 約5〜8分（X優先でY過移動を抑制） |
