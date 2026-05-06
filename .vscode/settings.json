@@ -1,0 +1,5 @@
+{
+  "platformio-ide.useBuiltinPython": true,
+  "platformio-ide.useBuiltinPIOCore": true,
+  "platformio-ide.customPATH": "/Users/katano/.platformio/penv/bin:/opt/homebrew/bin:/usr/bin:/bin"
+}
