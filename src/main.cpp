@@ -5,7 +5,10 @@
 #include <string.h>
 
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <M5Unified.h>
+#include <WebServer.h>
+#include <WiFi.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,8 +20,13 @@ namespace {
 constexpr int kImageWidth = 320;   // plate画像の横幅(px)
 constexpr int kImageHeight = 120;  // plate画像の縦幅(px)
 constexpr int kImageBytesPerRow = 40;  // 320bit / 8 = 40byte
+constexpr int kImageDataSize = 0x12c1;
 constexpr int kStickNeutral = 128;
 constexpr int kDisplayRefreshMs = 100;
+constexpr const char *kCustomImagePath = "/image.bin";
+constexpr const char *kUploadTempPath = "/image.tmp";
+constexpr const char *kApSsid = "AtomS3-ImageUI";
+constexpr const char *kApPassword = "12345678";
 
 // カーソル移動の挙動を調整する値はここだけ見れば変更できるように集約。
 // 時間はすべてmsで直接指定する。kReportIntervalMsの倍数に切り捨てられるので注意。
@@ -202,11 +210,182 @@ public:
 
 static SwitchHIDDevice switch_hid_device;
 static USBHID switch_hid;
+static WebServer web_server(80);
 
 static printer_state_t printer_state = {};
 static bool usb_mounted = false;  // Switch側でUSB HIDが列挙済みか
 static bool start_requested = false;  // BtnAで開始要求が入ったか
 static volatile bool force_display_refresh = false;  // 表示タスクへの強制再描画フラグ
+static uint8_t custom_image_data[kImageDataSize] = {};
+static const uint8_t *active_image_data = image_data;
+static bool custom_image_loaded = false;
+static File upload_file;
+static size_t upload_received_bytes = 0;
+static bool upload_failed = false;
+static String upload_error_message;
+
+static const char kWebUiHtml[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AtomS3 Image Uploader</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: sans-serif; margin: 20px; max-width: 900px; }
+    .row { margin-bottom: 12px; }
+    button { padding: 8px 14px; margin-right: 8px; }
+    canvas { border: 1px solid #555; image-rendering: pixelated; width: 640px; height: 240px; max-width: 100%; }
+    .mono { font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <h1>AtomS3 Image Uploader</h1>
+  <p>320x120にリサイズして1bit化し、デバイスへ保存します。</p>
+
+  <div class="row">
+    <input id="file" type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+  </div>
+
+  <div class="row">
+    <label>Threshold: <span id="thv">128</span></label>
+    <input id="threshold" type="range" min="0" max="255" value="128">
+    <label style="margin-left:12px;"><input id="invert" type="checkbox"> Invert</label>
+  </div>
+
+  <div class="row">
+    <button id="upload" disabled>Upload to AtomS3</button>
+    <button id="clear">Use built-in image</button>
+  </div>
+
+  <div class="row">
+    <canvas id="preview" width="320" height="120"></canvas>
+  </div>
+
+  <div class="row mono" id="status">Status: waiting file...</div>
+
+  <script>
+    const fileInput = document.getElementById('file');
+    const threshold = document.getElementById('threshold');
+    const thv = document.getElementById('thv');
+    const invert = document.getElementById('invert');
+    const uploadBtn = document.getElementById('upload');
+    const clearBtn = document.getElementById('clear');
+    const statusEl = document.getElementById('status');
+    const canvas = document.getElementById('preview');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    let loadedImage = null;
+
+    function setStatus(text) {
+      statusEl.textContent = 'Status: ' + text;
+    }
+
+    function renderPreview() {
+      if (!loadedImage) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, 320, 120);
+        uploadBtn.disabled = true;
+        return;
+      }
+
+      ctx.drawImage(loadedImage, 0, 0, 320, 120);
+      const img = ctx.getImageData(0, 0, 320, 120);
+      const data = img.data;
+      const th = Number(threshold.value);
+      const inv = invert.checked;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+        let on = gray < th;
+        if (inv) on = !on;
+        const v = on ? 255 : 0;
+        data[i] = v;
+        data[i + 1] = v;
+        data[i + 2] = v;
+      }
+
+      ctx.putImageData(img, 0, 0);
+      uploadBtn.disabled = false;
+    }
+
+    function buildPackedBytes() {
+      const img = ctx.getImageData(0, 0, 320, 120);
+      const data = img.data;
+      const out = new Uint8Array(0x12c1);
+      let outIndex = 0;
+
+      for (let y = 0; y < 120; y++) {
+        for (let x = 0; x < 320; x += 8) {
+          let b = 0;
+          for (let bit = 0; bit < 8; bit++) {
+            const px = x + bit;
+            const i = (y * 320 + px) * 4;
+            const isInk = data[i] === 255;
+            if (isInk) b |= (1 << bit);
+          }
+          out[outIndex++] = b;
+        }
+      }
+
+      out[out.length - 1] = 0;
+      return out;
+    }
+
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) {
+        loadedImage = null;
+        renderPreview();
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        loadedImage = img;
+        renderPreview();
+        setStatus('preview ready');
+      };
+      img.onerror = () => setStatus('failed to load image');
+      img.src = URL.createObjectURL(f);
+    });
+
+    threshold.addEventListener('input', () => {
+      thv.textContent = threshold.value;
+      renderPreview();
+    });
+
+    invert.addEventListener('change', renderPreview);
+
+    uploadBtn.addEventListener('click', async () => {
+      try {
+        const bytes = buildPackedBytes();
+        const form = new FormData();
+        form.append('image', new Blob([bytes], { type: 'application/octet-stream' }), 'image.bin');
+        setStatus('uploading...');
+        const r = await fetch('/api/upload', { method: 'POST', body: form });
+        const t = await r.text();
+        if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+        setStatus(t || 'uploaded');
+      } catch (e) {
+        setStatus('upload failed: ' + e.message);
+      }
+    });
+
+    clearBtn.addEventListener('click', async () => {
+      try {
+        const r = await fetch('/api/clear', { method: 'POST' });
+        const t = await r.text();
+        if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+        setStatus(t || 'cleared');
+      } catch (e) {
+        setStatus('clear failed: ' + e.message);
+      }
+    });
+  </script>
+</body>
+</html>
+)HTML";
 
 static void reset_printer_state(void) {
   memset(&printer_state, 0, sizeof(printer_state));
@@ -226,10 +405,177 @@ static inline size_t image_index(int x, int y) {
   return (size_t)(x / 8) + ((size_t)y * kImageBytesPerRow);
 }
 
+static bool load_custom_image_from_fs(void) {
+  if (!LittleFS.exists(kCustomImagePath)) {
+    active_image_data = image_data;
+    custom_image_loaded = false;
+    return false;
+  }
+
+  File f = LittleFS.open(kCustomImagePath, "r");
+  if (!f) {
+    ESP_LOGE(TAG, "Failed to open custom image: %s", kCustomImagePath);
+    active_image_data = image_data;
+    custom_image_loaded = false;
+    return false;
+  }
+
+  if ((int)f.size() != kImageDataSize) {
+    ESP_LOGE(TAG, "Invalid custom image size: %d", (int)f.size());
+    f.close();
+    LittleFS.remove(kCustomImagePath);
+    active_image_data = image_data;
+    custom_image_loaded = false;
+    return false;
+  }
+
+  const size_t read_len = f.read(custom_image_data, kImageDataSize);
+  f.close();
+  if (read_len != kImageDataSize) {
+    ESP_LOGE(TAG, "Failed to read custom image bytes: %d", (int)read_len);
+    active_image_data = image_data;
+    custom_image_loaded = false;
+    return false;
+  }
+
+  active_image_data = custom_image_data;
+  custom_image_loaded = true;
+  ESP_LOGI(TAG, "Custom image loaded from LittleFS");
+  return true;
+}
+
+static void handle_web_root(void) {
+  web_server.send_P(200, "text/html; charset=utf-8", kWebUiHtml);
+}
+
+static void handle_web_status(void) {
+  char json[128];
+  const IPAddress ip = WiFi.softAPIP();
+  snprintf(json, sizeof(json),
+           "{\"customImage\":%s,\"ip\":\"%u.%u.%u.%u\"}",
+           custom_image_loaded ? "true" : "false",
+           ip[0], ip[1], ip[2], ip[3]);
+  web_server.send(200, "application/json", json);
+}
+
+static void handle_web_upload_chunk(void) {
+  HTTPUpload &upload = web_server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    upload_failed = false;
+    upload_error_message = "";
+    upload_received_bytes = 0;
+    if (LittleFS.exists(kUploadTempPath)) {
+      LittleFS.remove(kUploadTempPath);
+    }
+    upload_file = LittleFS.open(kUploadTempPath, "w");
+    if (!upload_file) {
+      upload_failed = true;
+      upload_error_message = "failed to open temp file";
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (upload_failed) {
+      return;
+    }
+    if (!upload_file) {
+      upload_failed = true;
+      upload_error_message = "temp file is not open";
+      return;
+    }
+    const size_t written = upload_file.write(upload.buf, upload.currentSize);
+    upload_received_bytes += written;
+    if (written != upload.currentSize) {
+      upload_failed = true;
+      upload_error_message = "write failed";
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (upload_file) {
+      upload_file.close();
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (upload_file) {
+      upload_file.close();
+    }
+    upload_failed = true;
+    upload_error_message = "upload aborted";
+    LittleFS.remove(kUploadTempPath);
+  }
+}
+
+static void handle_web_upload_finish(void) {
+  if (upload_file) {
+    upload_file.close();
+  }
+
+  if (upload_failed) {
+    LittleFS.remove(kUploadTempPath);
+    web_server.send(400, "text/plain", upload_error_message);
+    return;
+  }
+
+  if ((int)upload_received_bytes != kImageDataSize) {
+    LittleFS.remove(kUploadTempPath);
+    web_server.send(400, "text/plain", "invalid data size (expect 0x12c1 bytes)");
+    return;
+  }
+
+  if (LittleFS.exists(kCustomImagePath)) {
+    LittleFS.remove(kCustomImagePath);
+  }
+  if (!LittleFS.rename(kUploadTempPath, kCustomImagePath)) {
+    LittleFS.remove(kUploadTempPath);
+    web_server.send(500, "text/plain", "failed to store image");
+    return;
+  }
+
+  if (!load_custom_image_from_fs()) {
+    web_server.send(500, "text/plain", "failed to apply uploaded image");
+    return;
+  }
+
+  force_display_refresh = true;
+  web_server.send(200, "text/plain", "uploaded and applied");
+}
+
+static void handle_web_clear(void) {
+  if (LittleFS.exists(kCustomImagePath)) {
+    LittleFS.remove(kCustomImagePath);
+  }
+  active_image_data = image_data;
+  custom_image_loaded = false;
+  force_display_refresh = true;
+  web_server.send(200, "text/plain", "switched to built-in image");
+}
+
+static void begin_web_ui(void) {
+  WiFi.mode(WIFI_AP);
+  const bool ap_ok = WiFi.softAP(kApSsid, kApPassword);
+  if (!ap_ok) {
+    ESP_LOGE(TAG, "Failed to start SoftAP");
+  }
+
+  const IPAddress ip = WiFi.softAPIP();
+  ESP_LOGI(TAG, "Web UI AP: SSID=%s PASS=%s IP=%u.%u.%u.%u",
+           kApSsid, kApPassword, ip[0], ip[1], ip[2], ip[3]);
+
+  if (!LittleFS.begin(true)) {
+    ESP_LOGE(TAG, "LittleFS mount failed");
+  } else {
+    load_custom_image_from_fs();
+  }
+
+  web_server.on("/", HTTP_GET, handle_web_root);
+  web_server.on("/api/status", HTTP_GET, handle_web_status);
+  web_server.on("/api/upload", HTTP_POST, handle_web_upload_finish, handle_web_upload_chunk);
+  web_server.on("/api/clear", HTTP_POST, handle_web_clear);
+  web_server.begin();
+  ESP_LOGI(TAG, "Web UI started");
+}
+
 static bool current_pixel_should_ink(void) {
   const size_t index = image_index(printer_state.xpos, printer_state.ypos);
   const uint8_t bit = (uint8_t)(1U << (printer_state.xpos % 8));
-  return (image_data[index] & bit) != 0;
+  return (active_image_data[index] & bit) != 0;
 }
 
 static inline void press_a_if_current_pixel_should_ink(switch_input_report_t *report) {
@@ -256,7 +602,7 @@ static bool image_pixel_should_ink(int x, int y) {
   }
   const size_t index = image_index(x, y);
   const uint8_t bit = (uint8_t)(1U << (x % 8));
-  return (image_data[index] & bit) != 0;
+  return (active_image_data[index] & bit) != 0;
 }
 
 static void draw_plate_preview(int x, int y, int w, int h) {
@@ -303,14 +649,24 @@ static int current_progress_percent(void) {
 }
 
 static void draw_wait_screen(void) {
+  char line[32];
+  const IPAddress ip = WiFi.softAPIP();
   M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
   M5.Display.println("USB not mounted");
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.println("");
   M5.Display.println("Connect to Switch");
+  M5.Display.println("");
+  M5.Display.println("Web UI:");
+  snprintf(line, sizeof(line), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  M5.Display.println(line);
 }
 
 static void draw_ready_screen(int preview_w) {
+  M5.Display.setCursor(0, 14);
+  M5.Display.setTextColor(custom_image_loaded ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  M5.Display.println(custom_image_loaded ? "Image: custom" : "Image: built-in");
+  M5.Display.setCursor(0, 20);
   draw_plate_preview(kPreviewX, kPreviewY, preview_w, kPreviewHeight);
   M5.Display.setCursor(0, 72);
   M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -567,6 +923,7 @@ static void usb_report_task(void *arg) {
   bool last_usb_mounted = false;
 
   while (true) {
+    web_server.handleClient();
     M5.update();
     if (M5.BtnA.wasPressed()) {
       start_requested = true;
@@ -611,6 +968,7 @@ void setup() {
   USBHID::addDevice(&switch_hid_device, sizeof(switch_hid_report_descriptor));
   switch_hid.begin();
   USB.begin();
+  begin_web_ui();
 
   reset_printer_state();
   render_display(true);
