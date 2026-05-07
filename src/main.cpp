@@ -21,17 +21,36 @@ constexpr int kStickNeutral = 128;
 constexpr int kDisplayRefreshMs = 100;
 
 // カーソル移動の挙動を調整する値はここだけ見れば変更できるように集約。
+// 時間はすべてmsで直接指定する。kReportIntervalMsの倍数に切り捨てられるので注意。
 namespace cursor_tuning {
-constexpr int kReportIntervalMs = 5;  // Original互換: 5ms polling相当
-constexpr int kRowAnchorOvershootSteps = 0;  // Original互換: 行アンカー無効
-constexpr int kRowAnchorSettleFrames = 0;  // Original互換: 行アンカー待機なし
-constexpr int kStopPressEchoes = 2;  // Original互換: ECHOES=2
-constexpr int kMoveXEchoes = 2;  // Original互換: ECHOES=2
-constexpr int kAnchorMoveEchoes = 2;  // Original互換: ECHOES=2
-constexpr int kMoveYEchoes = 1;  // Y移動を合計2フレーム保持して0px取りこぼしを減らす
-constexpr int kPostMoveXSettleFrames = 0;  // Original互換: 追加待機なし
-constexpr int kPreMoveYSettleFrames = 2;  // Y移動前に中立待機を挟んで誤検出を減らす
-constexpr int kPostMoveYSettleFrames = 2;  // Y移動後にも中立待機を入れて連続下入力を防ぐ
+// ---- 送信ループ周期 ----
+constexpr int kReportIntervalMs = 5;  // ESP32側の送信ループ周期(ms)。Switchの受付窓≈8ms。
+
+// ---- 行アンカー (通常は無効) ----
+constexpr int kRowAnchorOvershootSteps = 0;  // 行アンカーのオーバーシュート量(steps)。0=無効
+constexpr int kRowAnchorSettleMs = 0;  // 行アンカー後の中立待機時間(ms)
+
+// ---- ボタン押下・スティック入力の保持時間 ----
+constexpr int kStopPressHoldMs = 15;   // Aボタン押下の保持時間(ms)。kReportIntervalMsの倍数推奨
+constexpr int kMoveXHoldMs = 15;       // X方向スティック入力の保持時間(ms)
+constexpr int kAnchorMoveHoldMs = 15;  // アンカー移動時のスティック入力保持時間(ms)
+constexpr int kMoveYHoldMs = 10;       // Y方向スティック入力の保持時間(ms)。短すぎると0px取りこぼし
+
+// ---- Y移動前後の中立待機時間 ----
+constexpr int kPostMoveXSettleMs = 0;   // X移動後・Y移動前の中立待機時間(ms)
+constexpr int kPreMoveYSettleMs = 10;   // Y移動前の中立待機時間(ms)。前入力の誤検出を防ぐ
+constexpr int kPostMoveYSettleMs = 10;  // Y移動後の中立待機時間(ms)。連続下入力を防ぐ
+
+// ---- 上記ms値からフレーム数へ変換 (変更不要) ----
+// Echoes = 追加再送フレーム数。実効保持時間 = (1 + Echoes) × kReportIntervalMs ms
+constexpr int kRowAnchorSettleFrames = kRowAnchorSettleMs / kReportIntervalMs;
+constexpr int kStopPressEchoes       = kStopPressHoldMs   / kReportIntervalMs - 1;
+constexpr int kMoveXEchoes           = kMoveXHoldMs       / kReportIntervalMs - 1;
+constexpr int kAnchorMoveEchoes      = kAnchorMoveHoldMs  / kReportIntervalMs - 1;
+constexpr int kMoveYEchoes           = kMoveYHoldMs       / kReportIntervalMs - 1;
+constexpr int kPostMoveXSettleFrames = kPostMoveXSettleMs / kReportIntervalMs;
+constexpr int kPreMoveYSettleFrames  = kPreMoveYSettleMs  / kReportIntervalMs;
+constexpr int kPostMoveYSettleFrames = kPostMoveYSettleMs / kReportIntervalMs;
 }  // namespace cursor_tuning
 
 // プレビューと進捗バーの位置とサイズ。Original互換のため定数にしているが、実際には描画内容に応じて動的に変えても良い。
