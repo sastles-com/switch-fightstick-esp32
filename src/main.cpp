@@ -14,12 +14,15 @@
 #include "USBHID.h"
 
 namespace {
-constexpr int kImageWidth = 320;
-constexpr int kImageHeight = 120;
-constexpr int kImageBytesPerRow = 40;
+constexpr int kImageWidth = 320;   // plate画像の横幅(px)
+constexpr int kImageHeight = 120;  // plate画像の縦幅(px)
+constexpr int kImageBytesPerRow = 40;  // 320bit / 8 = 40byte
 constexpr int kStickNeutral = 128;
-constexpr int kReportIntervalMs = 5;  // Original互換: 5ms polling相当
 constexpr int kDisplayRefreshMs = 100;
+
+// カーソル移動の挙動を調整する値はここだけ見れば変更できるように集約。
+namespace cursor_tuning {
+constexpr int kReportIntervalMs = 5;  // Original互換: 5ms polling相当
 constexpr int kRowAnchorOvershootSteps = 0;  // Original互換: 行アンカー無効
 constexpr int kRowAnchorSettleFrames = 0;  // Original互換: 行アンカー待機なし
 constexpr int kStopPressEchoes = 2;  // Original互換: ECHOES=2
@@ -29,7 +32,9 @@ constexpr int kMoveYEchoes = 1;  // Y移動を合計2フレーム保持して0px
 constexpr int kPostMoveXSettleFrames = 0;  // Original互換: 追加待機なし
 constexpr int kPreMoveYSettleFrames = 2;  // Y移動前に中立待機を挟んで誤検出を減らす
 constexpr int kPostMoveYSettleFrames = 2;  // Y移動後にも中立待機を入れて連続下入力を防ぐ
+}  // namespace cursor_tuning
 
+// プレビューと進捗バーの位置とサイズ。Original互換のため定数にしているが、実際には描画内容に応じて動的に変えても良い。
 constexpr int kPreviewX = 4;
 constexpr int kPreviewY = 20;
 constexpr int kPreviewHeight = 45;
@@ -102,18 +107,18 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
   print_state_t state;
-  int echoes;
+  int echoes;  // 直前レポートを再送する残りフレーム数
   switch_input_report_t last_report;
-  int report_count;
-  int xpos;
-  int ypos;
-  int pre_move_y_settle_frames;
+  int report_count;  // SYNC系で使う汎用カウンタ
+  int xpos;  // 現在の描画X座標
+  int ypos;  // 現在の描画Y座標
+  int pre_move_y_settle_frames;  // Y移動前の中立待機フレーム
   print_state_t post_move_x_next_state;
-  int post_move_x_settle_frames;
-  int post_move_y_settle_frames;
-  int row_anchor_steps;
-  int row_settle_frames;
-  bool armed;
+  int post_move_x_settle_frames;  // X移動後の中立待機フレーム
+  int post_move_y_settle_frames;  // Y移動後の中立待機フレーム
+  int row_anchor_steps;  // 行頭アンカーで端方向に押し込む残りステップ
+  int row_settle_frames;  // 行頭アンカー後の待機フレーム
+  bool armed;  // true: 自動描画中 / false: 待機中
 } printer_state_t;
 
 static const char *TAG = "switch_fightstick";
@@ -180,9 +185,9 @@ static SwitchHIDDevice switch_hid_device;
 static USBHID switch_hid;
 
 static printer_state_t printer_state = {};
-static bool usb_mounted = false;
-static bool start_requested = false;
-static volatile bool force_display_refresh = false;
+static bool usb_mounted = false;  // Switch側でUSB HIDが列挙済みか
+static bool start_requested = false;  // BtnAで開始要求が入ったか
+static volatile bool force_display_refresh = false;  // 表示タスクへの強制再描画フラグ
 
 static void reset_printer_state(void) {
   memset(&printer_state, 0, sizeof(printer_state));
@@ -221,8 +226,8 @@ static inline bool row_scans_left_to_right(void) {
 static void begin_row_anchor(void) {
   // 偶数行は左端、奇数行は右端にアンカー
   printer_state.xpos = row_scans_left_to_right() ? 0 : (kImageWidth - 1);
-  printer_state.row_anchor_steps = kRowAnchorOvershootSteps;
-  printer_state.row_settle_frames = kRowAnchorSettleFrames;
+  printer_state.row_anchor_steps = cursor_tuning::kRowAnchorOvershootSteps;
+  printer_state.row_settle_frames = cursor_tuning::kRowAnchorSettleFrames;
   printer_state.state = STATE_REANCHOR_ROW;
 }
 
@@ -430,18 +435,18 @@ static void build_next_report(switch_input_report_t *report) {
     case STATE_STOP_X:
       press_a_if_current_pixel_should_ink(report);
       printer_state.state = STATE_MOVE_X;
-      printer_state.echoes = kStopPressEchoes;  // A押下をエコーで確実に届ける
+      printer_state.echoes = cursor_tuning::kStopPressEchoes;  // A押下をエコーで確実に届ける
       break;
 
     case STATE_STOP_Y:
       press_a_if_current_pixel_should_ink(report);
       if (printer_state.ypos < (kImageHeight - 1)) {
-        printer_state.pre_move_y_settle_frames = kPreMoveYSettleFrames;
+        printer_state.pre_move_y_settle_frames = cursor_tuning::kPreMoveYSettleFrames;
         printer_state.state = STATE_PRE_MOVE_Y_SETTLE;
       } else {
         printer_state.state = STATE_DONE;
       }
-      printer_state.echoes = kStopPressEchoes;  // A押下をエコーで確実に届ける
+      printer_state.echoes = cursor_tuning::kStopPressEchoes;  // A押下をエコーで確実に届ける
       break;
 
     case STATE_PRE_MOVE_Y_SETTLE:
@@ -467,8 +472,8 @@ static void build_next_report(switch_input_report_t *report) {
       } else {
         printer_state.post_move_x_next_state = STATE_STOP_Y;
       }
-      printer_state.echoes = kMoveXEchoes;
-      printer_state.post_move_x_settle_frames = kPostMoveXSettleFrames;
+      printer_state.echoes = cursor_tuning::kMoveXEchoes;
+      printer_state.post_move_x_settle_frames = cursor_tuning::kPostMoveXSettleFrames;
       printer_state.state = STATE_POST_MOVE_X_SETTLE;
       break;
 
@@ -484,8 +489,8 @@ static void build_next_report(switch_input_report_t *report) {
     case STATE_MOVE_Y:
       report->hat = HAT_BOTTOM;
       printer_state.ypos++;
-      printer_state.echoes = kMoveYEchoes;
-      printer_state.post_move_y_settle_frames = kPostMoveYSettleFrames;
+      printer_state.echoes = cursor_tuning::kMoveYEchoes;
+      printer_state.post_move_y_settle_frames = cursor_tuning::kPostMoveYSettleFrames;
       printer_state.state = STATE_POST_MOVE_Y_SETTLE;
       break;
 
@@ -506,7 +511,7 @@ static void build_next_report(switch_input_report_t *report) {
       if (printer_state.row_anchor_steps == 0) {
         printer_state.state = STATE_REANCHOR_SETTLE;
       }
-      printer_state.echoes = kAnchorMoveEchoes;
+      printer_state.echoes = cursor_tuning::kAnchorMoveEchoes;
       break;
 
     case STATE_REANCHOR_SETTLE:
@@ -568,7 +573,7 @@ static void usb_report_task(void *arg) {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(kReportIntervalMs));
+    vTaskDelay(pdMS_TO_TICKS(cursor_tuning::kReportIntervalMs));
   }
 }
 
