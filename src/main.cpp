@@ -23,6 +23,7 @@ constexpr int kImageBytesPerRow = 40;  // 320bit / 8 = 40byte
 constexpr int kImageDataSize = 0x12c1;
 constexpr int kStickNeutral = 128;
 constexpr int kDisplayRefreshMs = 100;
+constexpr int kBtnALongPressMs = 1200;
 constexpr const char *kCustomImagePath = "/image.bin";
 constexpr const char *kUploadTempPath = "/image.tmp";
 constexpr const char *kApSsid = "AtomS3-ImageUI";
@@ -120,6 +121,7 @@ typedef enum {
   DISPLAY_READY,
   DISPLAY_PRINTING,
   DISPLAY_DONE,
+  DISPLAY_WEB_QR,
 } display_state_t;
 
 typedef struct __attribute__((packed)) {
@@ -216,6 +218,9 @@ static printer_state_t printer_state = {};
 static bool usb_mounted = false;  // Switch側でUSB HIDが列挙済みか
 static bool start_requested = false;  // BtnAで開始要求が入ったか
 static volatile bool force_display_refresh = false;  // 表示タスクへの強制再描画フラグ
+static bool show_web_qr = false;  // true: BtnA長押しでWeb接続QRを表示
+static uint32_t btn_a_press_start_ms = 0;
+static bool btn_a_long_press_handled = false;
 static uint8_t custom_image_data[kImageDataSize] = {};
 static const uint8_t *active_image_data = image_data;
 static bool custom_image_loaded = false;
@@ -605,6 +610,11 @@ static bool image_pixel_should_ink(int x, int y) {
   return (active_image_data[index] & bit) != 0;
 }
 
+static void build_web_ui_url(char *out, size_t out_size) {
+  const IPAddress ip = WiFi.softAPIP();
+  snprintf(out, out_size, "http://%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+}
+
 static void draw_plate_preview(int x, int y, int w, int h) {
   M5.Display.drawRect(x - 1, y - 1, w + 2, h + 2, TFT_DARKGREY);
   M5.Display.fillRect(x, y, w, h, TFT_BLACK);
@@ -621,6 +631,9 @@ static void draw_plate_preview(int x, int y, int w, int h) {
 }
 
 static display_state_t get_display_state(void) {
+  if (show_web_qr) {
+    return DISPLAY_WEB_QR;
+  }
   if (!usb_mounted) {
     return DISPLAY_WAIT_USB;
   }
@@ -660,6 +673,7 @@ static void draw_wait_screen(void) {
   M5.Display.println("Web UI:");
   snprintf(line, sizeof(line), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
   M5.Display.println(line);
+  M5.Display.println("Hold BtnA: QR");
 }
 
 static void draw_ready_screen(int preview_w) {
@@ -675,6 +689,7 @@ static void draw_ready_screen(int preview_w) {
   M5.Display.println("");
   M5.Display.println("Press BtnA");
   M5.Display.println("to start");
+  M5.Display.println("Hold BtnA: QR");
 }
 
 static void draw_printing_screen(int preview_w) {
@@ -703,6 +718,23 @@ static void draw_done_screen(int preview_w) {
   M5.Display.println("");
   M5.Display.println("Press BtnA");
   M5.Display.println("to run again");
+  M5.Display.println("Hold BtnA: QR");
+}
+
+static void draw_web_qr_screen(void) {
+  char url[48];
+  build_web_ui_url(url, sizeof(url));
+
+  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5.Display.println("Web UI QR");
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.println("Hold BtnA to close");
+
+  M5.Display.qrcode(url, 20, 20, 88, 5);
+
+  M5.Display.setCursor(0, 112);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.printf("SSID:%s\n", kApSsid);
 }
 
 static void render_display(bool force) {
@@ -748,6 +780,10 @@ static void render_display(bool force) {
 
     case DISPLAY_DONE:
       draw_done_screen(preview_w);
+      break;
+
+    case DISPLAY_WEB_QR:
+      draw_web_qr_screen();
       break;
   }
 
@@ -925,8 +961,26 @@ static void usb_report_task(void *arg) {
   while (true) {
     web_server.handleClient();
     M5.update();
+
     if (M5.BtnA.wasPressed()) {
-      start_requested = true;
+      btn_a_press_start_ms = millis();
+      btn_a_long_press_handled = false;
+    }
+
+    if (M5.BtnA.isPressed() && !btn_a_long_press_handled) {
+      const uint32_t pressed_ms = millis() - btn_a_press_start_ms;
+      if (pressed_ms >= (uint32_t)kBtnALongPressMs) {
+        btn_a_long_press_handled = true;
+        show_web_qr = !show_web_qr;
+        start_requested = false;
+        force_display_refresh = true;
+      }
+    }
+
+    if (M5.BtnA.wasReleased() && !btn_a_long_press_handled) {
+      if (!show_web_qr) {
+        start_requested = true;
+      }
     }
 
     usb_mounted = switch_hid.ready();
