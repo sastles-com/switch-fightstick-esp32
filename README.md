@@ -37,19 +37,23 @@ M5Stack AtomS3 を Nintendo Switch の USB HID コントローラーとして認
 1. AtomS3 を接続すると LCD に `Ready / Press BtnA` が表示される  
    （`USB not mounted` が続く場合はケーブルや接続先を確認）
 
-2. **BtnA（正面の丸ボタン）** を押すと描画が開始される
+2. **BtnA（正面の丸ボタン）** を短押しすると描画が開始される
 
 3. LCD に描画進捗（座標・パーセンテージ・プログレスバー）が表示される
 
 4. `Done / Press BtnA to run again` が表示されたら完了  
-   もう一度 BtnA を押すと最初から再描画できる
+   もう一度 BtnA を短押しすると最初から再描画できる
 
-### 注意事項
+### 描画画像の変更（Web UI）
 
-- 描画中は Switch のコントローラー入力を触らない
-- 描画中に USB を抜くと最初からやり直しになる
-- 描画時間は設定によって異なる（精度優先設定で約15〜20分）
-- カーソル位置がズレた場合は `kRowAnchorOvershootSteps` を増やして再試行する
+Web UI から 320×120px 相当の画像をアップロードして描画内容を変更できる。
+
+1. 通常画面で **BtnA を 1.2 秒長押し** すると QR モードへ入る
+2. LCD に Wi-Fi 接続用 QR（SSID: `AtomS3-ImageUI` / PW: `12345678`）が表示される
+3. スマホ等で QR を読み取って AP に接続する
+4. 接続が検知されると 500ms 後に **URL QR** へ自動切替する
+5. URL QR を読み取るかブラウザで `192.168.4.1` を開いて Web UI を操作する
+6. **BtnA 短押し** で QR モードを終了し通常画面へ戻る（AP も停止する）
 
 ---
 
@@ -57,20 +61,17 @@ M5Stack AtomS3 を Nintendo Switch の USB HID コントローラーとして認
 
 ```bash
 # ビルド
-PATH=/Users/katano/.platformio/penv/bin:/opt/homebrew/bin:/usr/bin:/bin \
-  /Users/katano/.platformio/penv/bin/pio run -e atoms3_arduino
+PATH=/Users/katano/.platformio/penv/bin:$PATH pio run -e atoms3_arduino
 
-# 書き込み
-PATH=/Users/katano/.platformio/penv/bin:/opt/homebrew/bin:/usr/bin:/bin \
-  /Users/katano/.platformio/penv/bin/pio run -e atoms3_arduino -t upload \
-  --upload-port /dev/cu.usbmodem1101
+# 書き込み（VS Code の Upload タスクでも可）
+PATH=/Users/katano/.platformio/penv/bin:$PATH pio run -e atoms3_arduino -t upload
 ```
-
-VS Code の Upload タスク（`platformio run --target upload`）でも書き込み可能。
 
 ---
 
-## 画像の準備
+## 画像の準備（静的データとして焼く場合）
+
+Web UI を使わず、ファームウェアに画像を直接焼く場合。
 
 1. `plate.png` を 320×120px で用意する
 2. 黒ピクセル → インク、白ピクセル → 無し（デフォルト）
@@ -82,152 +83,158 @@ python3 png2c.py -t esp32 -o src/image_data.c plate.png
 
 ### データ検証スクリプト
 
-`debug_image.py` を実行すると `image_data.c` を画像に復元して `plate.png` と差分チェックし、
-デバッグ用分割画像（4x拡大）を出力する。
+`debug_image.py` を実行すると `image_data.c` を画像に復元して差分チェックできる。
 
 ```bash
 python3 debug_image.py
-# → debug_reconstructed.png, debug_top_half.png, debug_bottom_half.png など
+# → debug_reconstructed.png 等を出力
 ```
 
 ---
 
-## 動作フロー
+## ファイル構成
 
-1. 起動 → LCD に "Ready / Press BtnA" を表示
-2. BtnA 押下 → コントローラー同期 → 原点合わせ → 描画開始
-3. 蛇行走査（偶数行: 左→右、奇数行: 右→左）で全 320×120 ピクセルを描画
-4. 完了 → LCD に "Done / Press BtnA to run again"
+```
+src/
+  main.cpp           メインロジック（HID・Web UI・表示タスク）
+  image_data.c       組み込み画像データ（320×120 1bit packed）
+  image_data.h
+images/
+  image_data-mao.c           バックアップ用画像（マオ）
+  image_data-karasu-tonbi.c  バックアップ用画像（カラストンビ）
+png2c.py             PNG → image_data.c 変換スクリプト
+```
+
+`images/` 内のファイルはビルド対象外。差し替える場合は `src/image_data.c` へコピーする。
 
 ---
 
-## 修正ログ
+## ボタン操作仕様
 
-### 座標ズレ対策
+| 画面状態 | BtnA 短押し | BtnA 長押し（1.2秒） |
+|---|---|---|
+| 通常待機（Ready/Done） | 印刷開始 | QRモードへ |
+| 印刷中 | 即中止（中立レポート送信） | なし |
+| QRモード | 通常画面へ戻る（AP停止） | なし |
 
-#### [1] 移動中のA押下を禁止
-- **問題**: `STATE_MOVE_X` / `STATE_MOVE_Y` 中にも印字判定が走り、移動フレームで誤って A が押されていた
-- **修正**: A 押下判定を `STATE_STOP_X` / `STATE_STOP_Y`（座標確定フレーム）のみに限定
-- **ファイル**: `src/main.cpp` — `press_a_if_current_pixel_should_ink()` を STOP 状態のみで呼ぶ
+---
 
-#### [2] 左右端アンカー（過走査）の追加
+## QRモード・APモード仕様
+
+- AP は **QRモード突入時にのみ起動** し、QRモード終了時に停止する
+- QR 表示の流れ:
+  1. Wi-Fi 接続用 QR（AP 参加用）を表示
+  2. 端末の AP 接続を検知 → 500ms デバウンス → URL QR へ自動切替
+  3. BtnA 短押しで QRモード終了・AP停止・通常画面へ
+- キャプティブポータル: DNS キャッチオール + 主要 OS 検出 URL リダイレクト対応
+
+---
+
+## Web UI 機能
+
+| 機能 | 説明 |
+|---|---|
+| 画像アップロード | PNG/JPEG/WEBP/BMP をブラウザ側で 320×120 1bit 化して送信 |
+| プレビュー | canvas でリアルタイム 1bit 変換結果を表示（threshold / invert 調整可） |
+| 現在画像の表示 | ページ読み込み時に `/api/image` からデバイス上の画像を取得して canvas に描画 |
+| built-in 画像へ戻す | `Use built-in image` ボタン |
+| ランタイムチューニング | 送信間隔・各保持時間(ms)を Web UI から変更（再起動まで有効） |
+
+### API エンドポイント
+
+| エンドポイント | メソッド | 説明 |
+|---|---|---|
+| `/` | GET | Web UI HTML |
+| `/api/status` | GET | ステータス JSON |
+| `/api/image` | GET | 現在の画像データ（320×120 1bit packed、4801バイト） |
+| `/api/upload` | POST | 画像バイナリアップロード（LittleFS `/image.bin` に保存） |
+| `/api/clear` | POST | 組み込み画像に戻す（`/image.bin` を削除） |
+| `/api/tuning` | GET | チューニング値取得 JSON |
+| `/api/tuning` | POST | チューニング値設定（フォームデータ） |
+
+### 画像データ形式（`/image.bin`）
+
+- 320×120 ピクセル、1bit packed
+- 合計 4801 バイト（`0x12c1`）
+- バイト内のビット順: LSB → 左ピクセル、MSB → 右ピクセル
+- 行順: 上から順（Y=0 が先頭）
+- 起動時に LittleFS から自動読み込み。ファイルがなければ組み込み画像を使用
+
+---
+
+## 動作フロー（印刷）
+
+1. 起動 → LittleFS から `/image.bin` を読み込み（なければ組み込み画像を使用）
+2. LCD に "Ready / Press BtnA" を表示
+3. BtnA 短押し → コントローラー同期 → 原点合わせ → 描画開始
+4. 蛇行走査（偶数行: 左→右、奇数行: 右→左）で全 320×120 ピクセルを描画
+5. 完了 → LCD に "Done / Press BtnA to run again"
+
+---
+
+## チューニングパラメータ（`src/main.cpp` の `cursor_tuning` namespace）
+
+すべて ms 単位で直接指定する。フレーム数は `kReportIntervalMs` で自動計算される。
+
+| 定数名 | 現在値 | 説明 |
+|---|---|---|
+| `kReportIntervalMs` | 5 ms | HID レポート送信ループ周期 |
+| `kRowAnchorOvershootSteps` | 0 | 行開始時の端方向オーバーシュート量（0=無効） |
+| `kRowAnchorSettleMs` | 0 ms | アンカー後の中立待機時間 |
+| `kStopPressHoldMs` | 15 ms | A ボタン押下の保持時間 |
+| `kMoveXHoldMs` | 15 ms | X 方向スティック入力の保持時間 |
+| `kAnchorMoveHoldMs` | 15 ms | アンカー移動時のスティック保持時間 |
+| `kMoveYHoldMs` | 10 ms | Y 方向スティック入力の保持時間 |
+| `kPreMoveYSettleMs` | 10 ms | Y 移動前の中立待機時間 |
+| `kPostMoveYSettleMs` | 10 ms | Y 移動後の中立待機時間 |
+| `kPostMoveXSettleMs` | 0 ms | X 移動後の中立待機時間 |
+
+Web UI の Tuning セクションから `intervalMs` / `stopPressHoldMs` / `moveXHoldMs` / `moveYHoldMs` / `anchorMoveHoldMs` をランタイムで上書きできる（再起動で初期値に戻る）。
+
+---
+
+## 所要時間の目安
+
+| 設定 | 所要時間 |
+|---|---|
+| 初期（5ms / echoes=2 一律） | 約3分（高速だがズレやすい） |
+| 精度優先版（16ms / echoes=4 一律） | 約15〜20分（遅いが安定） |
+| 現在（5ms / STOP=15ms / MOVE_X=15ms / MOVE_Y=10ms） | 約5〜8分 |
+
+---
+
+## 座標ズレ修正ログ
+
+### [1] 移動中の A 押下を禁止
+- **問題**: `STATE_MOVE_X/Y` 中にも印字判定が走り、移動フレームで誤って A が押されていた
+- **修正**: A 押下判定を `STATE_STOP_X/Y`（座標確定フレーム）のみに限定
+
+### [2] 左右端アンカー（過走査）の追加
 - **問題**: 行ごとに座標ズレが累積し、右端に到達できないことがあった
-- **修正**: 各行の開始時に端方向へ `kRowAnchorOvershootSteps` フレーム押し続けて壁に当て、
-  その後 `kRowAnchorSettleFrames` フレーム入力なしで安定させてから描画開始する
-- **追加状態**: `STATE_REANCHOR_ROW`（過走査）、`STATE_REANCHOR_SETTLE`（安定待ち）
-- **ファイル**: `src/main.cpp` — `begin_row_anchor()`、`STATE_REANCHOR_ROW`、`STATE_REANCHOR_SETTLE`
+- **修正**: 各行開始時に端方向へ押し続けて壁当て → 安定待ち → 描画開始
 
-#### [3] SendReport 失敗時の巻き戻し
-- **問題**: `build_next_report` で状態を更新した後 `SendReport` が失敗すると、
-  入力が Switch に届かないまま `xpos` だけ進んでズレていた
-- **修正**: `build_next_report` 前に `printer_state` を保存し、`SendReport` が `false` を返したら復元する
-- **ファイル**: `src/main.cpp` — `usb_report_task` 内の `saved_state` 巻き戻し処理
+### [3] SendReport 失敗時の巻き戻し
+- **問題**: `build_next_report` で状態更新後に `SendReport` 失敗 → 内部座標だけ進む
+- **修正**: 送信前に `printer_state` を保存し、失敗時に復元
 
-#### [4] 表示タスクの分離
-- **問題**: LCD の描画（`draw_plate_preview` で 320×120 ループ）が HID タスクをブロックし、
-  `vTaskDelay(5ms)` の周期が実際は 10〜20ms になって Switch 側に入力ロストが発生していた
-- **修正**: `render_display` を優先度 3 の `display_task` へ切り出し、
-  HID タスク（優先度 5）は USB 送信のみに専念させる
-- **ファイル**: `src/main.cpp` — `display_task`（新規）、`usb_report_task` から描画処理を削除
+### [4] 表示タスクの分離
+- **問題**: LCD 描画ループが HID タスクをブロックし送信周期が乱れていた
+- **修正**: `display_task`（優先度3）を分離し、HID タスク（優先度5）は送信のみ専念
 
-#### [5] レポート送信間隔・精度パラメータの調整
-- **問題**: 5ms 送信が Switch の USB HID ポーリング（約 8ms）より速く、バッファ上書きでロストしていた
-- **修正**: 各パラメータを精度優先に調整
+### [5] チューニングパラメータの ms 直接指定化
+- **修正**: フレーム数でなく ms で直接指定する `cursor_tuning` namespace に集約。フレーム数は自動計算
 
-| パラメータ | 初期値 | 最終値 | 意図 |
-|---|---|---|---|
-| `kReportIntervalMs` | 5ms | 16ms | Switch polling の2倍マージン |
-| `kRowAnchorOvershootSteps` | 6 | 30 | 端壁への押し付けを確実に |
-| `kRowAnchorSettleFrames` | 2 | 5 | 安定待ちを長く |
-| `echoes`（STOP系のみ適用） | 2 | 2 | STOP状態のA押下のみ繰り返し。移動系はエコーなし |
+### [6] 移動系・A 押下系で保持時間を分離
+- **問題**: 統一エコー数だと Y 方向に過移動が発生
+- **修正**: STOP 系・MOVE_X 系・MOVE_Y 系で保持時間を個別設定
 
-#### [6] 移動系・A押下系でエコー数を分離
+### [7] X 移動の保持時間を個別調整
+- **問題**: Y 方向単発化後、X 方向の取りこぼしが発生するケースが出た
+- **修正**: X 方向と左右アンカーのみ短い保持時間を付与
 
-- **問題**: `echoes=4` × `16ms` = 80ms ずっと `HAT_BOTTOM` / `HAT_RIGHT` / `HAT_LEFT` が押され続け、ゲーム側で5〜6行・列分カーソルが余分に移動していた（縦方向が2倍以上の間隔になる症状）
-- **修正**: エコーを状態ごとに個別設定する構造に変更
-
-| 状態 | エコー | 理由 |
-|---|---|---|
-| `STATE_STOP_X` / `STATE_STOP_Y` | 2フレーム | A ボタン押下を確実に届ける |
-| `STATE_MOVE_X` / `STATE_MOVE_Y` | 0（なし） | 1フレームのみ入力して1ピクセル移動 |
-| `STATE_REANCHOR_ROW` / `STATE_REANCHOR_SETTLE` | 0（なし） | 毎フレーム1ステップずつ制御する |
-
-- **ファイル**: `src/main.cpp` — `STATE_STOP_X` / `STATE_STOP_Y` 内で `printer_state.echoes = 2` を個別設定
-
-#### [7] X移動の保持時間を個別調整
-
-- **問題**: Y方向の過移動対策で移動系を単発化した後、X方向だけ入力が通りにくくなるケースが出た
-- **修正**: X方向移動と左右アンカーのみ短い保持（2フレーム）を付与し、Y方向は単発維持
-
-| 状態 | エコー | 目的 |
-|---|---|---|
-| `STATE_MOVE_X` | 1（合計2フレーム） | X移動の取りこぼし対策 |
-| `STATE_REANCHOR_ROW` | 1（合計2フレーム） | 左右端へのアンカー精度向上 |
-| `STATE_MOVE_Y` | 0（単発） | 縦方向の過移動を抑制 |
-
-- **ファイル**: `src/main.cpp` — `kMoveXEchoes` と `kAnchorMoveEchoes` を追加
-
-#### [8] Y移動の0px取りこぼし対策
-
-- **問題**: Y移動を完全単発（1フレーム）にすると、まれに入力が拾われず0pxになるケースがあった
-- **修正**: `STATE_MOVE_Y` の保持を 1 フレーム延長し、合計2フレームで確実に下入力を届ける
-
-| 状態 | エコー | 目的 |
-|---|---|---|
-| `STATE_MOVE_Y` | 1（合計2フレーム） | 0px取りこぼしを抑制 |
-
-- **ファイル**: `src/main.cpp` — `kMoveYEchoes` を `0 -> 1` に変更
-
----
-
-## 現在のパラメータ設定（`src/main.cpp` の `namespace` ブロック）
-
-| 定数名 | 現在値 | 単位 | 説明 | 小さくすると | 大きくすると |
-|---|---|---|---|---|---|
-| `kReportIntervalMs` | 5 | ms | HID レポートの送信間隔 | 速くなるがロストしやすい | 遅くなるが安定しやすい |
-| `kRowAnchorOvershootSteps` | 0 | フレーム | 行開始時の端方向過走査フレーム数 | アンカー動作がなくなる | 端合わせが強くなるが遅くなる |
-| `kRowAnchorSettleFrames` | 0 | フレーム | アンカー後の待機フレーム数 | 即描画開始 | 安定するが遅くなる |
-| `kStopPressEchoes` | 2 | フレーム | STOP状態のA押下を繰り返す回数 | A押下取りこぼしが増える | A押下は安定するが遅くなる |
-| `kMoveXEchoes` | 2 | フレーム | X移動入力の保持回数（合計3フレーム） | X移動が通りにくくなる | X移動は通りやすいが過移動リスク増 |
-| `kAnchorMoveEchoes` | 2 | フレーム | アンカー移動入力の保持回数（合計3フレーム） | 端到達が不安定になる | 端到達は安定するが速度低下 |
-| `kMoveYEchoes` | 1 | フレーム | Y移動入力の保持回数（合計2フレーム） | 取りこぼしが増える | 縦過移動リスクが増える |
-| `kPostMoveXSettleFrames` | 0 | フレーム | X移動後の中立待機フレーム数 | すぐ次入力へ | 安定するが遅くなる |
-| `kPostMoveYSettleFrames` | 2 | フレーム | Y移動後の中立待機フレーム数 | 連続下入力が起きやすい | 縦方向の過移動を抑えやすい |
-| `kDisplayRefreshMs` | 100 | ms | LCD表示の更新間隔 | 表示更新が細かくなる | 表示更新が粗くなる |
-
----
-
-## パラメータ設定の履歴
-
-| 項目 | 変更履歴 | 目的・理由 |
-|---|---|---|
-| `kReportIntervalMs` | 5 → 16 → 8 | 取りこぼし対策で一度16msへ。縦過移動抑制と速度バランスで8msへ再調整 |
-| `kRowAnchorOvershootSteps` | 6 → 10 → 20 → 30 → 45 → 0 | 端合わせ強化を試行後、Original互換検証のため0へ |
-| `kRowAnchorSettleFrames` | 2 → 5 → 0 | 安定待ち追加を試行後、Original互換検証のため0へ |
-| STOP系エコー | 2 → 4 → 2 → 3 → 2 | 全体4を分離。最終的にOriginal互換2へ |
-| X移動エコー | 0 → 1 → 2 | X入力不足対策として段階的に増加 |
-| アンカー移動エコー | 0 → 1 → 3 → 2 | 端到達改善を試行後、Original互換寄りに調整 |
-| Y移動エコー | 0 → 2 → 0 → 1 | 縦過移動抑制を維持しつつ0px取りこぼしを減らすため1へ |
-| `kPostMoveYSettleFrames` | 0 → 2 | Y移動後の惰性入力抑制を追加 |
-
----
-
-## デバッグ対応（実施済み）
-
-1. image_data の逆変換検証
-- `debug_image.py` で `src/image_data.c` を PNG に復元
-- `plate.png` との差分ピクセルを計算して一致確認
-
-2. 送信失敗時の状態巻き戻し
-- `SendReport` 失敗時に `printer_state` を復元
-- 内部座標だけ進む不整合を防止
-
-3. 表示負荷とUSB送信の分離
-- `display_task` と `usb_report_task` を分割
-- LCD描画による HID 送信遅延を低減
-
-4. X/Y 別の入力制御
-- Xは保持時間を増やし、Yは単発+中立待機で過移動を抑制
+### [8] Y 移動の 0px 取りこぼし対策
+- **問題**: Y 移動完全単発化でまれに 0px になるケースがあった
+- **修正**: Y 方向も最低限の保持時間（10ms）を確保
 
 ---
 
@@ -236,15 +243,3 @@ python3 debug_image.py
 - https://github.com/shinyquagsire23/Switch-Fightstick
 - https://github.com/Loloweb/Switch-Fightstick
 - https://github.com/progmem/Switch-Fightstick
-
----
-
-## 所要時間の目安
-
-状態ごとにエコー数が異なるため、以下は実運用時の目安時間。
-
-| 設定 | 所要時間 |
-|---|---|
-| 初期（5ms / echoes=2 一律） | 約3分（高速だがズレやすい） |
-| 精度優先版（16ms / echoes=4 一律） | 約15〜20分（遅いが安定） |
-| 現在（5ms / STOP=2 / MOVE_X=2 / MOVE_Y=1 / postY=2） | 約5〜8分（Y取りこぼしを抑えつつ過移動を抑制） |

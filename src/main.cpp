@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <LittleFS.h>
 #include <M5Unified.h>
 #include <WebServer.h>
@@ -23,7 +24,7 @@ constexpr int kImageBytesPerRow = 40;  // 320bit / 8 = 40byte
 constexpr int kImageDataSize = 0x12c1;
 constexpr int kStickNeutral = 128;
 constexpr int kDisplayRefreshMs = 100;
-constexpr int kBtnALongPressMs = 1200;
+constexpr int kBtnALongPressMs = 2000;
 constexpr const char *kCustomImagePath = "/image.bin";
 constexpr const char *kUploadTempPath = "/image.tmp";
 constexpr const char *kApSsid = "AtomS3-ImageUI";
@@ -213,11 +214,13 @@ public:
 static SwitchHIDDevice switch_hid_device;
 static USBHID switch_hid;
 static WebServer web_server(80);
+static DNSServer dns_server;
 
 static printer_state_t printer_state = {};
 static bool usb_mounted = false;  // Switch側でUSB HIDが列挙済みか
 static bool start_requested = false;  // BtnAで開始要求が入ったか
 static volatile bool force_display_refresh = false;  // 表示タスクへの強制再描画フラグ
+static volatile bool btn_a_being_held_for_qr = false;  // 長押しQRモード用: ボタン押下中で長押し判定前
 static bool show_web_qr = false;  // true: BtnA長押しでWeb接続QRを表示
 static uint32_t btn_a_press_start_ms = 0;
 static bool btn_a_long_press_handled = false;
@@ -228,6 +231,76 @@ static File upload_file;
 static size_t upload_received_bytes = 0;
 static bool upload_failed = false;
 static String upload_error_message;
+
+typedef struct {
+  int report_interval_ms;
+  int stop_press_hold_ms;
+  int move_x_hold_ms;
+  int anchor_move_hold_ms;
+  int move_y_hold_ms;
+} runtime_tuning_t;
+
+static runtime_tuning_t runtime_tuning = {
+  cursor_tuning::kReportIntervalMs,
+  cursor_tuning::kStopPressHoldMs,
+  cursor_tuning::kMoveXHoldMs,
+  cursor_tuning::kAnchorMoveHoldMs,
+  cursor_tuning::kMoveYHoldMs,
+};
+
+static int clamp_int(int v, int min_v, int max_v) {
+  if (v < min_v) return min_v;
+  if (v > max_v) return max_v;
+  return v;
+}
+
+static int tuning_interval_ms(void) {
+  return clamp_int(runtime_tuning.report_interval_ms, 1, 33);
+}
+
+static int tuning_echoes_from_hold_ms(int hold_ms) {
+  const int interval_ms = tuning_interval_ms();
+  const int echoes = (hold_ms / interval_ms) - 1;
+  return echoes > 0 ? echoes : 0;
+}
+
+static int tuning_frames_from_ms(int wait_ms) {
+  const int interval_ms = tuning_interval_ms();
+  const int frames = wait_ms / interval_ms;
+  return frames > 0 ? frames : 0;
+}
+
+static int tuning_stop_press_echoes(void) {
+  return tuning_echoes_from_hold_ms(clamp_int(runtime_tuning.stop_press_hold_ms, 1, 200));
+}
+
+static int tuning_move_x_echoes(void) {
+  return tuning_echoes_from_hold_ms(clamp_int(runtime_tuning.move_x_hold_ms, 1, 200));
+}
+
+static int tuning_anchor_move_echoes(void) {
+  return tuning_echoes_from_hold_ms(clamp_int(runtime_tuning.anchor_move_hold_ms, 1, 200));
+}
+
+static int tuning_move_y_echoes(void) {
+  return tuning_echoes_from_hold_ms(clamp_int(runtime_tuning.move_y_hold_ms, 1, 200));
+}
+
+static int tuning_row_anchor_settle_frames(void) {
+  return tuning_frames_from_ms(cursor_tuning::kRowAnchorSettleMs);
+}
+
+static int tuning_pre_move_y_settle_frames(void) {
+  return tuning_frames_from_ms(cursor_tuning::kPreMoveYSettleMs);
+}
+
+static int tuning_post_move_x_settle_frames(void) {
+  return tuning_frames_from_ms(cursor_tuning::kPostMoveXSettleMs);
+}
+
+static int tuning_post_move_y_settle_frames(void) {
+  return tuning_frames_from_ms(cursor_tuning::kPostMoveYSettleMs);
+}
 
 static const char kWebUiHtml[] PROGMEM = R"HTML(
 <!doctype html>
@@ -241,6 +314,14 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     body { font-family: sans-serif; margin: 20px; max-width: 900px; }
     .row { margin-bottom: 12px; }
     button { padding: 8px 14px; margin-right: 8px; }
+    .danger {
+      background: #c62828;
+      color: #fff;
+      border: 1px solid #8e0000;
+      font-weight: 700;
+    }
+    .danger:hover { background: #b71c1c; }
+    .hint { color: #666; font-size: 13px; }
     canvas { border: 1px solid #555; image-rendering: pixelated; width: 640px; height: 240px; max-width: 100%; }
     .mono { font-family: ui-monospace, monospace; }
   </style>
@@ -257,12 +338,31 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     <label>Threshold: <span id="thv">128</span></label>
     <input id="threshold" type="range" min="0" max="255" value="128">
     <label style="margin-left:12px;"><input id="invert" type="checkbox"> Invert</label>
+    <label style="margin-left:12px;"><input id="dither" type="checkbox" checked> Dither</label>
   </div>
 
   <div class="row">
     <button id="upload" disabled>Upload to AtomS3</button>
     <button id="clear">Use built-in image</button>
   </div>
+
+  <h2>Tuning</h2>
+  <div class="row">
+    <label>Report interval(ms): <input id="reportIntervalMs" type="number" min="1" max="33" value="5" style="width:72px"></label>
+  </div>
+  <div class="row">
+    <label>Stop press hold(ms): <input id="stopPressHoldMs" type="number" min="1" max="200" value="15" style="width:72px"></label>
+    <label style="margin-left:12px;">Move X hold(ms): <input id="moveXHoldMs" type="number" min="1" max="200" value="15" style="width:72px"></label>
+  </div>
+  <div class="row">
+    <label>Anchor hold(ms): <input id="anchorMoveHoldMs" type="number" min="1" max="200" value="15" style="width:72px"></label>
+    <label style="margin-left:12px;">Move Y hold(ms): <input id="moveYHoldMs" type="number" min="1" max="200" value="10" style="width:72px"></label>
+  </div>
+  <div class="row">
+    <button id="saveTuning">Save Tuning</button>
+    <button id="done" class="danger">完了して再起動</button>
+  </div>
+  <div class="row hint">※ 設定反映後に押すと、デバイスを再起動してQRモードを終了します。</div>
 
   <div class="row">
     <canvas id="preview" width="320" height="120"></canvas>
@@ -275,13 +375,23 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     const threshold = document.getElementById('threshold');
     const thv = document.getElementById('thv');
     const invert = document.getElementById('invert');
+    const dither = document.getElementById('dither');
     const uploadBtn = document.getElementById('upload');
     const clearBtn = document.getElementById('clear');
+    const saveTuningBtn = document.getElementById('saveTuning');
+    const doneBtn = document.getElementById('done');
     const statusEl = document.getElementById('status');
     const canvas = document.getElementById('preview');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
+    const reportIntervalMs = document.getElementById('reportIntervalMs');
+    const stopPressHoldMs = document.getElementById('stopPressHoldMs');
+    const moveXHoldMs = document.getElementById('moveXHoldMs');
+    const anchorMoveHoldMs = document.getElementById('anchorMoveHoldMs');
+    const moveYHoldMs = document.getElementById('moveYHoldMs');
+
     let loadedImage = null;
+    let doneArmedUntil = 0;
 
     function setStatus(text) {
       statusEl.textContent = 'Status: ' + text;
@@ -301,14 +411,48 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
       const th = Number(threshold.value);
       const inv = invert.checked;
 
-      for (let i = 0; i < data.length; i += 4) {
-        const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-        let on = gray < th;
-        if (inv) on = !on;
-        const v = on ? 255 : 0;
-        data[i] = v;
-        data[i + 1] = v;
-        data[i + 2] = v;
+      if (dither.checked) {
+        // Floyd-Steinberg error diffusion (png2c.py の convert("1") に近い見た目)
+        const lum = new Float32Array(320 * 120);
+        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+          lum[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        }
+
+        for (let y = 0; y < 120; y++) {
+          for (let x = 0; x < 320; x++) {
+            const idx = y * 320 + x;
+            const oldVal = lum[idx];
+            let on = oldVal < th;
+            if (inv) on = !on;
+            const newVal = on ? 255 : 0;
+            const err = oldVal - newVal;
+            lum[idx] = newVal;
+
+            if (x + 1 < 320) lum[idx + 1] += err * (7 / 16);
+            if (y + 1 < 120) {
+              if (x > 0) lum[idx + 320 - 1] += err * (3 / 16);
+              lum[idx + 320] += err * (5 / 16);
+              if (x + 1 < 320) lum[idx + 320 + 1] += err * (1 / 16);
+            }
+          }
+        }
+
+        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+          const v = lum[p] > 127 ? 255 : 0;
+          data[i] = v;
+          data[i + 1] = v;
+          data[i + 2] = v;
+        }
+      } else {
+        for (let i = 0; i < data.length; i += 4) {
+          const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+          let on = gray < th;
+          if (inv) on = !on;
+          const v = on ? 255 : 0;
+          data[i] = v;
+          data[i + 1] = v;
+          data[i + 2] = v;
+        }
       }
 
       ctx.putImageData(img, 0, 0);
@@ -361,6 +505,7 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     });
 
     invert.addEventListener('change', renderPreview);
+    dither.addEventListener('change', renderPreview);
 
     uploadBtn.addEventListener('click', async () => {
       try {
@@ -387,6 +532,92 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
         setStatus('clear failed: ' + e.message);
       }
     });
+
+    async function loadTuning() {
+      try {
+        const r = await fetch('/api/tuning');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const cfg = await r.json();
+        reportIntervalMs.value = cfg.reportIntervalMs;
+        stopPressHoldMs.value = cfg.stopPressHoldMs;
+        moveXHoldMs.value = cfg.moveXHoldMs;
+        anchorMoveHoldMs.value = cfg.anchorMoveHoldMs;
+        moveYHoldMs.value = cfg.moveYHoldMs;
+      } catch (e) {
+        setStatus('load tuning failed: ' + e.message);
+      }
+    }
+
+    saveTuningBtn.addEventListener('click', async () => {
+      try {
+        const body = new URLSearchParams({
+          reportIntervalMs: reportIntervalMs.value,
+          stopPressHoldMs: stopPressHoldMs.value,
+          moveXHoldMs: moveXHoldMs.value,
+          anchorMoveHoldMs: anchorMoveHoldMs.value,
+          moveYHoldMs: moveYHoldMs.value,
+        });
+
+        const r = await fetch('/api/tuning', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+        });
+        const t = await r.text();
+        if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+        setStatus(t || 'tuning saved');
+      } catch (e) {
+        setStatus('save tuning failed: ' + e.message);
+      }
+    });
+
+    doneBtn.addEventListener('click', async () => {
+      try {
+        const now = Date.now();
+        if (now > doneArmedUntil) {
+          doneArmedUntil = now + 5000;
+          setStatus('5秒以内にもう一度押すと再起動します');
+          return;
+        }
+
+        doneBtn.disabled = true;
+        setStatus('restarting device...');
+        const r = await fetch('/api/done', { method: 'POST' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+      } catch (e) {
+        doneBtn.disabled = false;
+        doneArmedUntil = 0;
+        setStatus('restart failed: ' + e.message);
+      }
+    });
+
+    async function loadCurrentImage() {
+      try {
+        const r = await fetch('/api/image');
+        if (!r.ok) return;
+        const buf = await r.arrayBuffer();
+        const src = new Uint8Array(buf);
+        const imgData = ctx.createImageData(320, 120);
+        const pixels = imgData.data;
+        let byteIdx = 0;
+        for (let y = 0; y < 120; y++) {
+          for (let x = 0; x < 320; x += 8) {
+            const b = src[byteIdx++];
+            for (let bit = 0; bit < 8; bit++) {
+              const i = (y * 320 + x + bit) * 4;
+              const v = (b >> bit) & 1 ? 255 : 0;
+              pixels[i] = v; pixels[i+1] = v; pixels[i+2] = v; pixels[i+3] = 255;
+            }
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+      } catch (e) {
+        // 取得失敗時は無視
+      }
+    }
+
+    loadTuning();
+    loadCurrentImage();
   </script>
 </body>
 </html>
@@ -453,6 +684,11 @@ static void handle_web_root(void) {
   web_server.send_P(200, "text/html; charset=utf-8", kWebUiHtml);
 }
 
+static void handle_web_captive_redirect(void) {
+  web_server.sendHeader("Location", "http://192.168.4.1/", true);
+  web_server.send(302, "text/plain", "Redirecting to captive portal");
+}
+
 static void handle_web_status(void) {
   char json[128];
   const IPAddress ip = WiFi.softAPIP();
@@ -461,6 +697,45 @@ static void handle_web_status(void) {
            custom_image_loaded ? "true" : "false",
            ip[0], ip[1], ip[2], ip[3]);
   web_server.send(200, "application/json", json);
+}
+
+static int arg_to_int_or_default(const char *name, int default_value) {
+  if (!web_server.hasArg(name)) {
+    return default_value;
+  }
+  return web_server.arg(name).toInt();
+}
+
+static void handle_web_get_tuning(void) {
+  char json[256];
+  snprintf(json, sizeof(json),
+           "{\"reportIntervalMs\":%d,\"stopPressHoldMs\":%d,\"moveXHoldMs\":%d,"
+           "\"anchorMoveHoldMs\":%d,\"moveYHoldMs\":%d}",
+           runtime_tuning.report_interval_ms,
+           runtime_tuning.stop_press_hold_ms,
+           runtime_tuning.move_x_hold_ms,
+           runtime_tuning.anchor_move_hold_ms,
+           runtime_tuning.move_y_hold_ms);
+  web_server.send(200, "application/json", json);
+}
+
+// Forward declaration
+static void save_tuning_to_fs(void);
+
+static void handle_web_set_tuning(void) {
+  runtime_tuning.report_interval_ms = clamp_int(
+      arg_to_int_or_default("reportIntervalMs", runtime_tuning.report_interval_ms), 1, 33);
+  runtime_tuning.stop_press_hold_ms = clamp_int(
+      arg_to_int_or_default("stopPressHoldMs", runtime_tuning.stop_press_hold_ms), 1, 200);
+  runtime_tuning.move_x_hold_ms = clamp_int(
+      arg_to_int_or_default("moveXHoldMs", runtime_tuning.move_x_hold_ms), 1, 200);
+  runtime_tuning.anchor_move_hold_ms = clamp_int(
+      arg_to_int_or_default("anchorMoveHoldMs", runtime_tuning.anchor_move_hold_ms), 1, 200);
+  runtime_tuning.move_y_hold_ms = clamp_int(
+      arg_to_int_or_default("moveYHoldMs", runtime_tuning.move_y_hold_ms), 1, 200);
+
+  save_tuning_to_fs();
+  web_server.send(200, "text/plain", "tuning updated and persisted");
 }
 
 static void handle_web_upload_chunk(void) {
@@ -552,6 +827,67 @@ static void handle_web_clear(void) {
   web_server.send(200, "text/plain", "switched to built-in image");
 }
 
+static void handle_web_get_image(void) {
+  // ESP32ではPROGMEMもRAMもアドレス空間が共通なのでsend_Pでどちらも送信できる。
+  web_server.send_P(200, "application/octet-stream",
+                    reinterpret_cast<PGM_P>(active_image_data), kImageDataSize);
+}
+
+static void load_tuning_from_fs(void) {
+  if (!LittleFS.exists("/tuning.json")) {
+    return;
+  }
+  File f = LittleFS.open("/tuning.json", "r");
+  if (!f) return;
+  
+  String content = f.readString();
+  f.close();
+  
+  // 簡易JSONパース: キーの値を抽出
+  int val;
+  if (sscanf(content.c_str(), "{\"reportIntervalMs\":%d", &val) == 1) {
+    runtime_tuning.report_interval_ms = val;
+  }
+  if (strstr(content.c_str(), "\"stopPressHoldMs\":") != NULL) {
+    sscanf(strstr(content.c_str(), "\"stopPressHoldMs\":"), "\"stopPressHoldMs\":%d", &val);
+    runtime_tuning.stop_press_hold_ms = val;
+  }
+  if (strstr(content.c_str(), "\"moveXHoldMs\":") != NULL) {
+    sscanf(strstr(content.c_str(), "\"moveXHoldMs\":"), "\"moveXHoldMs\":%d", &val);
+    runtime_tuning.move_x_hold_ms = val;
+  }
+  if (strstr(content.c_str(), "\"moveYHoldMs\":") != NULL) {
+    sscanf(strstr(content.c_str(), "\"moveYHoldMs\":"), "\"moveYHoldMs\":%d", &val);
+    runtime_tuning.move_y_hold_ms = val;
+  }
+  if (strstr(content.c_str(), "\"anchorMoveHoldMs\":") != NULL) {
+    sscanf(strstr(content.c_str(), "\"anchorMoveHoldMs\":"), "\"anchorMoveHoldMs\":%d", &val);
+    runtime_tuning.anchor_move_hold_ms = val;
+  }
+}
+
+static void save_tuning_to_fs(void) {
+  File f = LittleFS.open("/tuning.json", "w");
+  if (!f) return;
+  
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"reportIntervalMs\":%d,\"stopPressHoldMs\":%d,\"moveXHoldMs\":%d,\"moveYHoldMs\":%d,\"anchorMoveHoldMs\":%d}",
+    runtime_tuning.report_interval_ms,
+    runtime_tuning.stop_press_hold_ms,
+    runtime_tuning.move_x_hold_ms,
+    runtime_tuning.move_y_hold_ms,
+    runtime_tuning.anchor_move_hold_ms);
+  f.write((uint8_t*)buf, strlen(buf));
+  f.close();
+}
+
+static void handle_web_done(void) {
+  web_server.send(200, "text/plain", "done");
+  delay(100);
+  esp_restart();
+}
+
 static void begin_web_ui(void) {
   WiFi.mode(WIFI_AP);
   const bool ap_ok = WiFi.softAP(kApSsid, kApPassword);
@@ -563,17 +899,25 @@ static void begin_web_ui(void) {
   ESP_LOGI(TAG, "Web UI AP: SSID=%s PASS=%s IP=%u.%u.%u.%u",
            kApSsid, kApPassword, ip[0], ip[1], ip[2], ip[3]);
 
-  if (!LittleFS.begin(true)) {
-    ESP_LOGE(TAG, "LittleFS mount failed");
-  } else {
-    load_custom_image_from_fs();
-  }
-
   web_server.on("/", HTTP_GET, handle_web_root);
+  // OSのキャプティブポータル判定URLを拾ってWeb UIへ誘導する。
+  web_server.on("/generate_204", HTTP_GET, handle_web_captive_redirect);         // Android
+  web_server.on("/gen_204", HTTP_GET, handle_web_captive_redirect);              // Android variants
+  web_server.on("/hotspot-detect.html", HTTP_GET, handle_web_captive_redirect);  // iOS/macOS
+  web_server.on("/library/test/success.html", HTTP_GET, handle_web_captive_redirect);  // iOS/macOS
+  web_server.on("/ncsi.txt", HTTP_GET, handle_web_captive_redirect);             // Windows
+  web_server.on("/connecttest.txt", HTTP_GET, handle_web_captive_redirect);      // Windows
   web_server.on("/api/status", HTTP_GET, handle_web_status);
+  web_server.on("/api/tuning", HTTP_GET, handle_web_get_tuning);
+  web_server.on("/api/tuning", HTTP_POST, handle_web_set_tuning);
   web_server.on("/api/upload", HTTP_POST, handle_web_upload_finish, handle_web_upload_chunk);
   web_server.on("/api/clear", HTTP_POST, handle_web_clear);
+  web_server.on("/api/image", HTTP_GET, handle_web_get_image);
+  web_server.on("/api/done", HTTP_POST, handle_web_done);
+  web_server.onNotFound(handle_web_captive_redirect);
   web_server.begin();
+
+  dns_server.start(53, "*", ip);
   ESP_LOGI(TAG, "Web UI started");
 }
 
@@ -597,7 +941,7 @@ static void begin_row_anchor(void) {
   // 偶数行は左端、奇数行は右端にアンカー
   printer_state.xpos = row_scans_left_to_right() ? 0 : (kImageWidth - 1);
   printer_state.row_anchor_steps = cursor_tuning::kRowAnchorOvershootSteps;
-  printer_state.row_settle_frames = cursor_tuning::kRowAnchorSettleFrames;
+  printer_state.row_settle_frames = tuning_row_anchor_settle_frames();
   printer_state.state = STATE_REANCHOR_ROW;
 }
 
@@ -615,15 +959,41 @@ static void build_web_ui_url(char *out, size_t out_size) {
   snprintf(out, out_size, "http://%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
+static void build_wifi_ap_qr_payload(char *out, size_t out_size) {
+  // Wi-Fi設定QRフォーマット: WIFI:T:<auth>;S:<ssid>;P:<password>;;
+  snprintf(out, out_size, "WIFI:T:WPA;S:%s;P:%s;;", kApSsid, kApPassword);
+}
+
 static void draw_plate_preview(int x, int y, int w, int h) {
   M5.Display.drawRect(x - 1, y - 1, w + 2, h + 2, TFT_DARKGREY);
   M5.Display.fillRect(x, y, w, h, TFT_BLACK);
 
+  // 単純な最近傍縮小だと細線が欠けやすいので、対応元領域の黒率で描画する。
+  constexpr int kInkPercentThreshold = 35;
+
   for (int dy = 0; dy < h; ++dy) {
-    const int sy = (dy * kImageHeight) / h;
+    int sy0 = (dy * kImageHeight) / h;
+    int sy1 = ((dy + 1) * kImageHeight) / h;
+    if (sy1 <= sy0) sy1 = sy0 + 1;
+    if (sy1 > kImageHeight) sy1 = kImageHeight;
+
     for (int dx = 0; dx < w; ++dx) {
-      const int sx = (dx * kImageWidth) / w;
-      if (image_pixel_should_ink(sx, sy)) {
+      int sx0 = (dx * kImageWidth) / w;
+      int sx1 = ((dx + 1) * kImageWidth) / w;
+      if (sx1 <= sx0) sx1 = sx0 + 1;
+      if (sx1 > kImageWidth) sx1 = kImageWidth;
+
+      int ink_count = 0;
+      const int total_count = (sx1 - sx0) * (sy1 - sy0);
+      for (int sy = sy0; sy < sy1; ++sy) {
+        for (int sx = sx0; sx < sx1; ++sx) {
+          if (image_pixel_should_ink(sx, sy)) {
+            ++ink_count;
+          }
+        }
+      }
+
+      if ((ink_count * 100) >= (total_count * kInkPercentThreshold)) {
         M5.Display.drawPixel(x + dx, y + dy, TFT_WHITE);
       }
     }
@@ -662,18 +1032,14 @@ static int current_progress_percent(void) {
 }
 
 static void draw_wait_screen(void) {
-  char line[32];
-  const IPAddress ip = WiFi.softAPIP();
   M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
   M5.Display.println("USB not mounted");
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.println("");
   M5.Display.println("Connect to Switch");
   M5.Display.println("");
-  M5.Display.println("Web UI:");
-  snprintf(line, sizeof(line), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-  M5.Display.println(line);
   M5.Display.println("Hold BtnA: QR");
+  M5.Display.println("(2 seconds)");
 }
 
 static void draw_ready_screen(int preview_w) {
@@ -722,22 +1088,37 @@ static void draw_done_screen(int preview_w) {
 }
 
 static void draw_web_qr_screen(void) {
+  char wifi_qr[96];
   char url[48];
+  build_wifi_ap_qr_payload(wifi_qr, sizeof(wifi_qr));
   build_web_ui_url(url, sizeof(url));
 
   M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-  M5.Display.println("Web UI QR");
+  M5.Display.println("AP Join QR");
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.println("Hold BtnA to close");
 
-  M5.Display.qrcode(url, 20, 20, 88, 5);
+  M5.Display.qrcode(wifi_qr, 20, 20, 88, 5);
 
   M5.Display.setCursor(0, 112);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.printf("SSID:%s\n", kApSsid);
+  M5.Display.printf("Open:%s\n", url);
 }
 
 static void render_display(bool force) {
+  // BtnA 長押し中のフィードバック: 画面点滅
+  if (btn_a_being_held_for_qr) {
+    // 500ms周期で点滅（250ms ON, 250ms OFF）
+    if ((millis() / 250) % 2 == 1) {
+      // 画面OFF時は黒く塗り潰すだけで終了
+      M5.Display.startWrite();
+      M5.Display.fillScreen(TFT_BLACK);
+      M5.Display.endWrite();
+      return;
+    }
+  }
+
   static display_state_t last_state = DISPLAY_WAIT_USB;
   static int last_xpos = -1;
   static int last_ypos = -1;
@@ -846,18 +1227,18 @@ static void build_next_report(switch_input_report_t *report) {
     case STATE_STOP_X:
       press_a_if_current_pixel_should_ink(report);
       printer_state.state = STATE_MOVE_X;
-      printer_state.echoes = cursor_tuning::kStopPressEchoes;  // A押下をエコーで確実に届ける
+      printer_state.echoes = tuning_stop_press_echoes();  // A押下をエコーで確実に届ける
       break;
 
     case STATE_STOP_Y:
       press_a_if_current_pixel_should_ink(report);
       if (printer_state.ypos < (kImageHeight - 1)) {
-        printer_state.pre_move_y_settle_frames = cursor_tuning::kPreMoveYSettleFrames;
+        printer_state.pre_move_y_settle_frames = tuning_pre_move_y_settle_frames();
         printer_state.state = STATE_PRE_MOVE_Y_SETTLE;
       } else {
         printer_state.state = STATE_DONE;
       }
-      printer_state.echoes = cursor_tuning::kStopPressEchoes;  // A押下をエコーで確実に届ける
+      printer_state.echoes = tuning_stop_press_echoes();  // A押下をエコーで確実に届ける
       break;
 
     case STATE_PRE_MOVE_Y_SETTLE:
@@ -883,8 +1264,8 @@ static void build_next_report(switch_input_report_t *report) {
       } else {
         printer_state.post_move_x_next_state = STATE_STOP_Y;
       }
-      printer_state.echoes = cursor_tuning::kMoveXEchoes;
-      printer_state.post_move_x_settle_frames = cursor_tuning::kPostMoveXSettleFrames;
+      printer_state.echoes = tuning_move_x_echoes();
+      printer_state.post_move_x_settle_frames = tuning_post_move_x_settle_frames();
       printer_state.state = STATE_POST_MOVE_X_SETTLE;
       break;
 
@@ -900,8 +1281,8 @@ static void build_next_report(switch_input_report_t *report) {
     case STATE_MOVE_Y:
       report->hat = HAT_BOTTOM;
       printer_state.ypos++;
-      printer_state.echoes = cursor_tuning::kMoveYEchoes;
-      printer_state.post_move_y_settle_frames = cursor_tuning::kPostMoveYSettleFrames;
+      printer_state.echoes = tuning_move_y_echoes();
+      printer_state.post_move_y_settle_frames = tuning_post_move_y_settle_frames();
       printer_state.state = STATE_POST_MOVE_Y_SETTLE;
       break;
 
@@ -922,7 +1303,7 @@ static void build_next_report(switch_input_report_t *report) {
       if (printer_state.row_anchor_steps == 0) {
         printer_state.state = STATE_REANCHOR_SETTLE;
       }
-      printer_state.echoes = cursor_tuning::kAnchorMoveEchoes;
+      printer_state.echoes = tuning_anchor_move_echoes();
       break;
 
     case STATE_REANCHOR_SETTLE:
@@ -959,27 +1340,49 @@ static void usb_report_task(void *arg) {
   bool last_usb_mounted = false;
 
   while (true) {
+    dns_server.processNextRequest();
     web_server.handleClient();
     M5.update();
 
     if (M5.BtnA.wasPressed()) {
       btn_a_press_start_ms = millis();
       btn_a_long_press_handled = false;
+      btn_a_being_held_for_qr = false;
     }
 
     if (M5.BtnA.isPressed() && !btn_a_long_press_handled) {
       const uint32_t pressed_ms = millis() - btn_a_press_start_ms;
       if (pressed_ms >= (uint32_t)kBtnALongPressMs) {
         btn_a_long_press_handled = true;
-        show_web_qr = !show_web_qr;
+        btn_a_being_held_for_qr = false;
+        if (!show_web_qr) {
+          show_web_qr = true;
+          begin_web_ui();
+        }
         start_requested = false;
         force_display_refresh = true;
+      } else if (pressed_ms > 500) {
+        // 長押し判定前の途中で、ユーザーへのフィードバック開始
+        btn_a_being_held_for_qr = true;
       }
     }
 
-    if (M5.BtnA.wasReleased() && !btn_a_long_press_handled) {
-      if (!show_web_qr) {
-        start_requested = true;
+    if (M5.BtnA.wasReleased()) {
+      btn_a_being_held_for_qr = false;
+      if (!btn_a_long_press_handled) {
+        if (printer_state.armed) {
+          // 印刷中の短押しは即中止して、入力を中立に戻す。
+          printer_state.armed = false;
+          start_requested = false;
+          if (switch_hid.ready()) {
+            switch_input_report_t neutral_report;
+            reset_report(&neutral_report);
+            switch_hid.SendReport(0, &neutral_report, sizeof(neutral_report));
+          }
+          force_display_refresh = true;
+        } else if (!show_web_qr) {
+          start_requested = true;
+        }
       }
     }
 
@@ -1003,7 +1406,7 @@ static void usb_report_task(void *arg) {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(cursor_tuning::kReportIntervalMs));
+    vTaskDelay(pdMS_TO_TICKS(tuning_interval_ms()));
   }
 }
 
@@ -1022,7 +1425,13 @@ void setup() {
   USBHID::addDevice(&switch_hid_device, sizeof(switch_hid_report_descriptor));
   switch_hid.begin();
   USB.begin();
-  begin_web_ui();
+
+  // LittleFS 初期化（web_ui は QRモード突入時のみ）
+  if (!LittleFS.begin(true)) {
+    ESP_LOGE(TAG, "LittleFS mount failed");
+  } else {
+    load_tuning_from_fs();
+  }
 
   reset_printer_state();
   render_display(true);
