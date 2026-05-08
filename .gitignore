@@ -11,3 +11,10 @@ debug_*.png
 *.xcf
 image_esp32.c
 karasu-tonbi-*.png
+
+# 配布用バイナリ
+dist/*.bin
+dist/*.zip
+
+# 画像生成物
+images/

@@ -310,10 +310,30 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AtomS3 Image Uploader</title>
   <style>
-    :root { color-scheme: light; }
-    body { font-family: sans-serif; margin: 20px; max-width: 900px; }
+    :root {
+      color-scheme: light;
+      --preview-scale: 2;
+      --page-height-multiplier: 2;
+    }
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+      max-width: 1000px;
+      min-height: calc(100dvh * var(--page-height-multiplier));
+    }
     .row { margin-bottom: 12px; }
     button { padding: 8px 14px; margin-right: 8px; }
+    .link-btn {
+      display: inline-block;
+      padding: 8px 14px;
+      margin-right: 8px;
+      border: 1px solid #777;
+      border-radius: 6px;
+      color: #111;
+      background: #f5f5f5;
+      text-decoration: none;
+    }
+    .link-btn:hover { background: #ebebeb; }
     .danger {
       background: #c62828;
       color: #fff;
@@ -322,8 +342,22 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     }
     .danger:hover { background: #b71c1c; }
     .hint { color: #666; font-size: 13px; }
-    canvas { border: 1px solid #555; image-rendering: pixelated; width: 640px; height: 240px; max-width: 100%; }
+    .preview-wrap {
+      max-width: 100%;
+      overflow: auto;
+      border: 1px solid #555;
+      background: #fff;
+    }
+    canvas {
+      display: block;
+      image-rendering: pixelated;
+      width: calc(320px * var(--preview-scale));
+      height: calc(120px * var(--preview-scale));
+    }
     .mono { font-family: ui-monospace, monospace; }
+    @media (max-width: 600px) {
+      body { margin: 12px; }
+    }
   </style>
 </head>
 <body>
@@ -344,6 +378,7 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
   <div class="row">
     <button id="upload" disabled>Upload to AtomS3</button>
     <button id="clear">Use built-in image</button>
+    <a class="link-btn" href="http://192.168.4.1/" target="_blank" rel="noopener noreferrer">Open in browser</a>
   </div>
 
   <h2>Tuning</h2>
@@ -360,13 +395,28 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
   </div>
   <div class="row">
     <button id="saveTuning">Save Tuning</button>
-    <button id="done" class="danger">完了して再起動</button>
   </div>
-  <div class="row hint">※ 設定反映後に押すと、デバイスを再起動してQRモードを終了します。</div>
 
   <div class="row">
-    <canvas id="preview" width="320" height="120"></canvas>
+    <label>Preview scale: <span id="previewScaleValue">2.00x</span></label>
+    <input id="previewScale" type="range" min="1" max="6" step="0.25" value="2">
   </div>
+  <div class="row">
+    <label>Page height: <span id="pageHeightValue">2.00x</span></label>
+    <input id="pageHeight" type="range" min="1" max="3" step="0.25" value="2">
+  </div>
+
+  <div class="row">
+    <div class="preview-wrap">
+      <canvas id="preview" width="320" height="120"></canvas>
+    </div>
+  </div>
+
+  <div class="row">
+    <button id="done" class="danger">完了して再起動</button>
+    <button id="cancel">cancel</button>
+  </div>
+  <div class="row hint">※ 完了して再起動: upload後に再起動 / cancel: uploadせず再起動</div>
 
   <div class="row mono" id="status">Status: waiting file...</div>
 
@@ -380,7 +430,12 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     const clearBtn = document.getElementById('clear');
     const saveTuningBtn = document.getElementById('saveTuning');
     const doneBtn = document.getElementById('done');
+    const cancelBtn = document.getElementById('cancel');
     const statusEl = document.getElementById('status');
+    const previewScale = document.getElementById('previewScale');
+    const previewScaleValue = document.getElementById('previewScaleValue');
+    const pageHeight = document.getElementById('pageHeight');
+    const pageHeightValue = document.getElementById('pageHeightValue');
     const canvas = document.getElementById('preview');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
@@ -391,15 +446,69 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
     const moveYHoldMs = document.getElementById('moveYHoldMs');
 
     let loadedImage = null;
-    let doneArmedUntil = 0;
+
+    function updatePreviewScale(value) {
+      const scale = Math.min(6, Math.max(1, Number(value) || 2));
+      document.documentElement.style.setProperty('--preview-scale', String(scale));
+      previewScaleValue.textContent = scale.toFixed(2) + 'x';
+      previewScale.value = String(scale);
+      try {
+        localStorage.setItem('previewScale', String(scale));
+      } catch (e) {
+        // ignore storage errors
+      }
+    }
+
+    function updatePageHeight(value) {
+      const multiplier = Math.min(3, Math.max(1, Number(value) || 2));
+      document.documentElement.style.setProperty('--page-height-multiplier', String(multiplier));
+      pageHeightValue.textContent = multiplier.toFixed(2) + 'x';
+      pageHeight.value = String(multiplier);
+      try {
+        localStorage.setItem('pageHeightMultiplier', String(multiplier));
+      } catch (e) {
+        // ignore storage errors
+      }
+    }
 
     function setStatus(text) {
       statusEl.textContent = 'Status: ' + text;
     }
 
+    function bytesEqual(a, b) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
+    async function hasImageChanged() {
+      try {
+        const newBytes = buildPackedBytes();
+        const r = await fetch('/api/image');
+        if (!r.ok) return true;
+        const storedBuffer = await r.arrayBuffer();
+        const storedBytes = new Uint8Array(storedBuffer);
+        return !bytesEqual(newBytes, storedBytes);
+      } catch (e) {
+        return true;
+      }
+    }
+
+    async function uploadCurrentPreview() {
+      const bytes = buildPackedBytes();
+      const form = new FormData();
+      form.append('image', new Blob([bytes], { type: 'application/octet-stream' }), 'image.bin');
+      const r = await fetch('/api/upload', { method: 'POST', body: form });
+      const t = await r.text();
+      if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+      return t || 'uploaded';
+    }
+
     function renderPreview() {
       if (!loadedImage) {
-        ctx.fillStyle = '#000';
+        ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, 320, 120);
         uploadBtn.disabled = true;
         return;
@@ -424,7 +533,7 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
             const oldVal = lum[idx];
             let on = oldVal < th;
             if (inv) on = !on;
-            const newVal = on ? 255 : 0;
+            const newVal = on ? 0 : 255;
             const err = oldVal - newVal;
             lum[idx] = newVal;
 
@@ -448,7 +557,7 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
           const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
           let on = gray < th;
           if (inv) on = !on;
-          const v = on ? 255 : 0;
+          const v = on ? 0 : 255;
           data[i] = v;
           data[i + 1] = v;
           data[i + 2] = v;
@@ -471,7 +580,7 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
           for (let bit = 0; bit < 8; bit++) {
             const px = x + bit;
             const i = (y * 320 + px) * 4;
-            const isInk = data[i] === 255;
+            const isInk = data[i] === 0;
             if (isInk) b |= (1 << bit);
           }
           out[outIndex++] = b;
@@ -506,16 +615,17 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
 
     invert.addEventListener('change', renderPreview);
     dither.addEventListener('change', renderPreview);
+    previewScale.addEventListener('input', () => {
+      updatePreviewScale(previewScale.value);
+    });
+    pageHeight.addEventListener('input', () => {
+      updatePageHeight(pageHeight.value);
+    });
 
     uploadBtn.addEventListener('click', async () => {
       try {
-        const bytes = buildPackedBytes();
-        const form = new FormData();
-        form.append('image', new Blob([bytes], { type: 'application/octet-stream' }), 'image.bin');
         setStatus('uploading...');
-        const r = await fetch('/api/upload', { method: 'POST', body: form });
-        const t = await r.text();
-        if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+        const t = await uploadCurrentPreview();
         setStatus(t || 'uploaded');
       } catch (e) {
         setStatus('upload failed: ' + e.message);
@@ -573,20 +683,38 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
 
     doneBtn.addEventListener('click', async () => {
       try {
-        const now = Date.now();
-        if (now > doneArmedUntil) {
-          doneArmedUntil = now + 5000;
-          setStatus('5秒以内にもう一度押すと再起動します');
-          return;
-        }
-
+        if (!loadedImage) throw new Error('image is not selected');
         doneBtn.disabled = true;
-        setStatus('restarting device...');
+        cancelBtn.disabled = true;
+        setStatus('checking image...');
+        
+        const changed = await hasImageChanged();
+        if (changed) {
+          setStatus('uploading image and restarting...');
+          await uploadCurrentPreview();
+        } else {
+          setStatus('image unchanged, restarting...');
+        }
+        
         const r = await fetch('/api/done', { method: 'POST' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
       } catch (e) {
         doneBtn.disabled = false;
-        doneArmedUntil = 0;
+        cancelBtn.disabled = false;
+        setStatus('restart failed: ' + e.message);
+      }
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+      try {
+        doneBtn.disabled = true;
+        cancelBtn.disabled = true;
+        setStatus('restarting without upload...');
+        const r = await fetch('/api/done', { method: 'POST' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+      } catch (e) {
+        doneBtn.disabled = false;
+        cancelBtn.disabled = false;
         setStatus('restart failed: ' + e.message);
       }
     });
@@ -605,7 +733,7 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
             const b = src[byteIdx++];
             for (let bit = 0; bit < 8; bit++) {
               const i = (y * 320 + x + bit) * 4;
-              const v = (b >> bit) & 1 ? 255 : 0;
+              const v = (b >> bit) & 1 ? 0 : 255;
               pixels[i] = v; pixels[i+1] = v; pixels[i+2] = v; pixels[i+3] = 255;
             }
           }
@@ -618,6 +746,27 @@ static const char kWebUiHtml[] PROGMEM = R"HTML(
 
     loadTuning();
     loadCurrentImage();
+    try {
+      const savedPreviewScale = localStorage.getItem('previewScale');
+      if (savedPreviewScale) {
+        updatePreviewScale(savedPreviewScale);
+      } else {
+        updatePreviewScale(previewScale.value);
+      }
+    } catch (e) {
+      updatePreviewScale(previewScale.value);
+    }
+
+    try {
+      const savedPageHeight = localStorage.getItem('pageHeightMultiplier');
+      if (savedPageHeight) {
+        updatePageHeight(savedPageHeight);
+      } else {
+        updatePageHeight(pageHeight.value);
+      }
+    } catch (e) {
+      updatePageHeight(pageHeight.value);
+    }
   </script>
 </body>
 </html>
@@ -966,7 +1115,7 @@ static void build_wifi_ap_qr_payload(char *out, size_t out_size) {
 
 static void draw_plate_preview(int x, int y, int w, int h) {
   M5.Display.drawRect(x - 1, y - 1, w + 2, h + 2, TFT_DARKGREY);
-  M5.Display.fillRect(x, y, w, h, TFT_BLACK);
+  M5.Display.fillRect(x, y, w, h, TFT_WHITE);
 
   // 単純な最近傍縮小だと細線が欠けやすいので、対応元領域の黒率で描画する。
   constexpr int kInkPercentThreshold = 35;
@@ -994,7 +1143,7 @@ static void draw_plate_preview(int x, int y, int w, int h) {
       }
 
       if ((ink_count * 100) >= (total_count * kInkPercentThreshold)) {
-        M5.Display.drawPixel(x + dx, y + dy, TFT_WHITE);
+        M5.Display.drawPixel(x + dx, y + dy, TFT_BLACK);
       }
     }
   }
@@ -1430,6 +1579,7 @@ void setup() {
   if (!LittleFS.begin(true)) {
     ESP_LOGE(TAG, "LittleFS mount failed");
   } else {
+    load_custom_image_from_fs();
     load_tuning_from_fs();
   }
 
