@@ -4,6 +4,10 @@ Switch Fightstick (AtomS3) 配布用バイナリ
 - macOS: `MAC-SETUP.md`
 - Windows: `WINDOWS-SETUP.md`
 
+重要
+- `splatoon-atoms3-merged.bin` は組み込み画像を含んだ配布用ファームです。
+- Web UI で画像をアップロードしたことがある個体では、保存済みの `/image.bin` が優先されます。
+- 組み込み画像を使いたい場合は、Web UI の `Use built-in image` を押してください。
 ファイル一覧
 - splatoon-atoms3-merged.bin
   1本化済みイメージ。オフセット 0x0 に書き込んでください。
@@ -45,6 +49,7 @@ Windows での簡単な方法（自動スクリプト）
 
 注意
 - 上記スクリプトの実行には、esptool.py (または esptool) が PATH にある必要があります。
+- AtomS3 に保存済みのカスタム画像がある場合、組み込み画像よりそちらが優先されます。
 
 別案の書き込みコマンド（分割イメージ）
 - esptool.py --chip esp32s3 --port <PORT> --baud 460800 write_flash 0x0 bootloader.bin 0x8000 partitions.bin 0x10000 splatoon-atoms3-firmware.bin

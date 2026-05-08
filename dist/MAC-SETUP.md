@@ -92,6 +92,7 @@ ls
 
 - `splatoon-atoms3-merged.bin`
 - `flash_merged.sh`
+- `MAC-SETUP.md`
 - `README-distribution.txt`
 
 ---
@@ -141,6 +142,12 @@ chmod +x flash_merged.sh
 2. Switch へ接続
 3. 画面に `Ready` が出ることを確認
 
+組み込み画像 (`plate.png`) を確認したいのに以前アップロードした画像が出る場合:
+
+1. BtnA を 2 秒長押しして Web UI を開く
+2. `Use built-in image` を押す
+3. 再起動後に組み込み画像で動作することを確認する
+
 ---
 
 ## 6. うまくいかない時
@@ -172,3 +179,4 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 write_flash 
 - この配布では `splatoon-atoms3-merged.bin`（1本化イメージ）を使用しています。
 - 基本的にオフセットは `0x0` 固定です。
 - 既存環境を気にせず上書きしやすい方法です。
+- ただし Web UI で保存済みのカスタム画像 (`/image.bin`) は消えません。
