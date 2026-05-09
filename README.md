@@ -3,6 +3,8 @@
 M5Stack AtomS3 を Nintendo Switch の USB HID コントローラーとして認識させ、
 スプラトゥーンのなまえプレートに 320x120 の 1bit 画像を自動描画するツールです。
 
+English version: `README.en.md`
+
 ## 概要
 
 - ボード: M5Stack AtomS3 (ESP32-S3)
@@ -115,6 +117,9 @@ python3 debug_image.py
 - 配布概要: `dist/README-distribution.txt`
 - macOS 手順: `dist/MAC-SETUP.md`
 - Windows 手順: `dist/WINDOWS-SETUP.md`
+- English overview: `dist/README-distribution.en.txt`
+- English macOS guide: `dist/MAC-SETUP.en.md`
+- English Windows guide: `dist/WINDOWS-SETUP.en.md`
 
 主な配布物:
 
